@@ -16,11 +16,11 @@ Phase 1: Architecture Spikes & Deep Research ──► Phase 2: Lock-Free Core &
 - [ ] Research Spike 1.4: Linearizable Read Paths (Read-Index vs Leader Leases vs Quorum Reads).
 - [ ] Decision Gate: Align with user on key architectural trade-offs via targeted Q&A.
 
-## Phase 2: Lock-Free Memory Arena & Local KV Engine
-- [ ] Milestone 2.1: Cacheline-aligned slab/arena memory allocator.
-- [ ] Milestone 2.2: Lock-free index (concurrent skiplist / hash map) with safe reclamation.
-- [ ] Milestone 2.3: Disruptor-style ring buffer for internal message queues.
-- [ ] Milestone 2.4: Local micro-benchmarks & stress tests (evaluating cacheline contention & P99 latency).
+## Phase 2: Lock-Free Memory Arena & Local KV Engine [EXECUTED - pending verification]
+- [x] Milestone 2.1: Cacheline-aligned slab/arena memory allocator.
+- [x] Milestone 2.2: Lock-free index (concurrent skiplist / hash map) with safe reclamation.
+- [x] Milestone 2.3: Disruptor-style ring buffer for internal message queues.
+- [x] Milestone 2.4: Local micro-benchmarks & stress tests (evaluating cacheline contention & P99 latency).
 
 ## Phase 3: Consensus & Persistence Engine
 - [ ] Milestone 3.1: Raft protocol state machine & log store abstractions.
