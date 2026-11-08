@@ -1,40 +1,128 @@
-# Project Lightcycle
+<div align="center">
 
-> Sub-millisecond in-memory cache engine with Raft-based consensus replication and custom lock-free memory buffers.
+```text
+██╗     ██╗ ██████╗ ██╗  ██╗████████╗ ██████╗██╗   ██╗ ██████╗██╗     ███████╗
+██║     ██║██╔════╝ ██║  ██║╚══██╔══╝██╔════╝╚██╗ ██╔╝██╔════╝██║     ██╔════╝
+██║     ██║██║  ███╗███████║   ██║   ██║      ╚████╔╝ ██║     ██║     █████╗  
+██║     ██║██║   ██║██╔══██║   ██║   ██║       ╚██╔╝  ██║     ██║     ██╔══╝  
+███████╗██║╚██████╔╝██║  ██║   ██║   ╚██████╗   ██║   ╚██████╗███████╗███████╗
+╚══════╝╚═╝ ╚═════╝ ╚═╝  ╚═╝   ╚═╝    ╚═════╝   ╚═╝    ╚═════╝╚══════╝╚══════╝
+```
 
-Named after the high-speed, razor-sharp lightcycles traversing the Grid with zero latency and relentless coordination.
+### **GRID-SPEED IN-MEMORY CACHE & RAFT CONSENSUS ENGINE**
 
----
+[![Rust](https://img.shields.io/badge/RUST-1.75%2B-00e5ff?style=for-the-badge&logo=rust&logoColor=white&labelColor=03060f)](https://www.rust-lang.org/)
+[![Status](https://img.shields.io/badge/STATUS-ACTIVE%20RESEARCH-18a0ff?style=for-the-badge&labelColor=03060f)](https://github.com/bsommers)
+[![Latency](https://img.shields.io/badge/TAIL%20LATENCY-P99%20%3C%20150%C2%B5s-00e5ff?style=for-the-badge&labelColor=03060f)](#performance-targets)
+[![Replication](https://img.shields.io/badge/CONSENSUS-RAFT%20PIPELINED-00e5ff?style=for-the-badge&labelColor=03060f)](#the-solution)
 
-## 1. Goal
-
-Build a predictable, sub-millisecond, distributed in-memory key-value and cache store in Rust. Lightcycle combines lock-free shared-memory ring buffers (such as Disruptor/hazard pointer patterns) for single-digit microsecond local reads/writes with a pipelined Raft consensus engine for low-latency linearizable distributed mutations.
-
----
-
-## 2. Specification
-
-### 2.1 Core Architectural Pillars
-- **Lock-Free Cache Engine (Local Tier)**:
-  - Cache storage backed by cacheline-aligned memory blocks and lock-free concurrent hash maps (or lock-free skiplists).
-  - Allocation strategy minimizing allocator thrash (custom arena/slab allocators with chunk pooling).
-  - Lock-free ring buffer IPC / inter-thread message queues (Disruptor pattern).
-- **Consensus & Replication (Distributed Tier)**:
-  - Pipelined Raft consensus engine (or open-source Raft integration like `openraft` / `async-raft`).
-  - Batching and group commit for log compaction and disk/NVMe WAL syncing.
-  - Read-Index / Lease-Read optimization to achieve sub-millisecond local reads without consensus round-trip overhead on leader nodes.
-- **Client Protocol**:
-  - High-performance RESP (Redis-compatible) wire protocol subset (GET, SET, MGET, DEL, WATCH, CAS).
-  - Custom zero-copy binary RPC protocol over gRPC / raw TCP with framing.
-
-### 2.2 Performance Targets
-- **P99 Read Latency**: < 150 microseconds (local / leader lease read).
-- **P99 Write Latency**: < 2 milliseconds (3-node Raft consensus cluster with fsync batches).
-- **Throughput**: > 500,000 ops/sec per node.
+<p align="center">
+  <b>Sub-millisecond in-memory cache engine with Raft-based consensus replication and custom lock-free memory buffers.</b><br>
+  <i>Traversing the Grid with zero latency, lock-free ring buffers, and linearizable distributed state.</i>
+</p>
 
 ---
 
-## 3. Recommended Prompt for Next Refinement Phase
+</div>
+
+## ⚡ The Problem Statement
+
+Distributed caching and transactional storage systems currently force architectures to accept painful compromises across latency, concurrency, and consistency:
+
+```text
+┌───────────────────────────────┐     ┌────────────────────────────────┐
+│   Standard In-Memory Stores   │ vs  │  Traditional Distributed Raft  │
+│ (Redis, Memcached, Local L1)  │     │    (Etcd, Consul, ZooKeeper)   │
+├───────────────────────────────┤     ├────────────────────────────────┤
+│ ❌ Single-node failure domain  │     │ ❌ High tail latency (> 5-10ms)│
+│ ❌ Asynchronous replica loss  │     │ ❌ Synchronous quorum bottlenecks│
+│ ❌ Global mutexes & GC pauses │     │ ❌ Allocator churn under load  │
+└───────────────────────────────┘     └────────────────────────────────┘
+```
+
+1. **The Consistency vs. Latency Paradox**: Fast distributed caches traditionally rely on asynchronous replication, leaving systems vulnerable to silent data loss during node partitions. Conversely, strongly consistent systems (like Etcd or Consul) penalize reads and writes with multi-millisecond quorum negotiations, making them unusable as high-throughput application caches.
+2. **Lock Contention & Memory Fragmentation**: Modern multi-core servers choke on shared-mutex memory structures (B-Trees, locked hash tables) and standard heap allocators. Thread preemption and allocator lock contention cause severe tail-latency spikes (P99.9 > 15ms) when processing hundreds of thousands of operations per second.
+3. **Consensus Round-Trip Overhead on Reads**: Traditional Raft engines require an explicit consensus round-trip or serialization through a single leader state-machine loop for every read query, eliminating cache read efficiency.
+
+---
+
+## 💡 The Solution: Project Lightcycle
+
+**Lightcycle** decouples local hardware-speed memory execution from distributed linearizable consensus, synthesizing lock-free memory topology with an optimized pipelined Raft engine.
+
+```text
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │                      PROJECT LIGHTCYCLE ARCHITECTURE                   │
+ └────────────────────────────────────────────────────────────────────────┘
+
+    Client Operations (RESP / Custom Binary RPC)
+           │
+           ▼
+    ┌──────────────────────────────────────────────────────────────────┐
+    │  INGRESS & PROTOCOL DECODER (Zero-Copy Framing)                  │
+    └──────────────┬───────────────────────────────────┬───────────────┘
+                   │ [Read Path: Lease-Read / Index]   │ [Write Path: Propose]
+                   ▼                                   ▼
+    ┌──────────────────────────────┐    ┌──────────────────────────────┐
+    │ LOCK-FREE CACHE ARENA        │    │ PIPELINED RAFT CONSENSUS     │
+    │                              │    │                              │
+    │ • Cacheline-aligned blocks   │    │ • Non-blocking ring buffer   │
+    │ • Disruptor message ring     │◀───│ • Vectorized log batching    │
+    │ • Epoch-based reclamation    │Commit • Group commit to NVMe WAL  │
+    │ • P99 Read: < 150 µs         │    │ • P99 Write: < 2 ms (3-node) │
+    └──────────────────────────────┘    └──────────────────────────────┘
+                   ▲                                   │
+                   └───────────────────────────────────┘
+```
+
+### Architectural Pillars
+
+* **Lock-Free Cache Engine (Local Tier)**:
+  * Cache storage organized into cacheline-aligned 64-byte blocks to prevent false sharing across CPU cores.
+  * Multi-producer, single-consumer (MPSC) and Disruptor-style ring buffers replace kernel mutexes with atomic CAS primitives.
+  * Epoch-Based Reclamation (EBR) safely cleans stale pointers without stopping the world or suffering JVM-style GC pauses.
+* **Consensus & Replication (Distributed Tier)**:
+  * Pipelined Raft consensus engine decoupling log replication across network sockets from disk syncing.
+  * Leader Lease & Read-Index protocols enable **lock-free linearizable local reads** directly from the local memory arena without consensus network round-trips.
+  * Group commit and zero-copy append log for NVMe writes maximize I/O batching efficiency.
+* **Dual Wire Protocol**:
+  * Redis RESP-compatible subset (`GET`, `SET`, `MGET`, `DEL`, `CAS`) for drop-in application adoption.
+  * Ultra-low-overhead binary framing protocol for intra-cluster peer gossip and microsecond RPCs.
+
+---
+
+## 📊 Performance Targets
+
+| Metric | Target | Description |
+| :--- | :--- | :--- |
+| **P99 Read Latency** | `< 150 µs` | Local node / leader lease reads via lock-free memory arena |
+| **P99 Write Latency** | `< 2.0 ms` | 3-node distributed Raft consensus with persistent fsync batching |
+| **Throughput** | `> 500,000 ops/sec` | Sustained read/write operations per node on commodity modern hardware |
+| **Jitter / Max Pause** | `< 500 µs` | Zero stop-the-world garbage collection; deterministic epoch reclamation |
+
+---
+
+## 🛠️ Scaffolding & Quickstart
+
+```bash
+# 1. Verify Rust toolchain & dependencies
+cargo check
+
+# 2. Run local unit and integration tests
+cargo test
+
+# 3. Launch a standalone local Lightcycle node
+cargo run -- --node-id 1 --bind 127.0.0.1:7443
+
+# 4. Launch a 3-node local Raft cluster
+cargo run -- --node-id 1 --bind 127.0.0.1:7441 --peers "2=127.0.0.1:7442,3=127.0.0.1:7443" &
+cargo run -- --node-id 2 --bind 127.0.0.1:7442 --peers "1=127.0.0.1:7441,3=127.0.0.1:7443" &
+cargo run -- --node-id 3 --bind 127.0.0.1:7443 --peers "1=127.0.0.1:7441,2=127.0.0.1:7442"
+```
+
+---
+
+## 🔮 Next Refinement Phase Prompt
 
 ```text
 Act as a Principal Distributed Systems and Low-Latency Engineer. We are refining 'Project Lightcycle', a sub-millisecond distributed cache with Raft consensus and lock-free memory buffers written in Rust.
@@ -47,15 +135,6 @@ Please provide:
 
 ---
 
-## 4. Scaffolding & Getting Started
-
-```bash
-# Verify Rust toolchain
-cargo check
-
-# Run tests
-cargo test
-
-# Launch standalone node
-cargo run -- --node-id 1 --bind 127.0.0.1:7443
-```
+<div align="center">
+<sub>SYSTEM NOTICE: GRID COMMUNICATIONS ENCRYPTED &bull; LINEARIZABLE BY SPECIFICATION</sub>
+</div>
