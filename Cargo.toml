@@ -1,0 +1,17 @@
+[package]
+name = "lightcycle"
+version = "0.1.0"
+edition = "2021"
+description = "Sub-millisecond in-memory cache engine with Raft-based consensus replication and custom lock-free memory buffers"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+tokio = { version = "1.40", features = ["full"] }
+crossbeam = "0.8"
+parking_lot = "0.12"
+bytes = "1.7"
+serde = { version = "1.0", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1.0"
