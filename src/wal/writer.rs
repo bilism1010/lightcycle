@@ -1298,4 +1298,240 @@ mod tests {
             assert_eq!(&marker.payload[8..], b"keep-me");
         }
     }
+
+    // ---- Task 3: group commit, fail-stop, panic guard, fsync modes, wake-up ----
+
+    use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn group_commit_amortizes_syncs_and_acks_only_after_durable() {
+        let (mut h, io) = spawn_fake(cfg(1 << 18));
+        io.set_sync_delay(Duration::from_millis(2));
+        let done = Arc::new(AtomicUsize::new(0));
+        let bad = Arc::new(AtomicUsize::new(0));
+        for i in 1..=1000u64 {
+            let (io2, done2, bad2) = (io.clone(), Arc::clone(&done), Arc::clone(&bad));
+            let ack: Ack = Box::new(move |r| {
+                // At ack time the durable image must already hold this entry's record.
+                let durable = walk(&io2.durable_bytes(1)).0;
+                let present = durable.iter().any(|x| x.ty == RecordType::Entry && entry_index(x) == i);
+                if r.is_err() || !present {
+                    bad2.fetch_add(1, Ordering::SeqCst);
+                }
+                done2.fetch_add(1, Ordering::SeqCst);
+            });
+            submit(&mut h, WalOp::Entry { index: i, payload: body(i, 32), ack: Some(ack) });
+        }
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while done.load(Ordering::SeqCst) < 1000 {
+            assert!(Instant::now() < deadline, "acks missing: {}", done.load(Ordering::SeqCst));
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(bad.load(Ordering::SeqCst), 0, "an ack fired before its entry was durable");
+        let syncs = h.stats().syncs.load(Ordering::Relaxed);
+        assert!((1..=50).contains(&syncs), "1000 appends caused {syncs} syncs");
+        h.shutdown();
+    }
+
+    #[test]
+    fn fail_stop_after_sync_error() {
+        let (mut h, io) = spawn_fake(cfg(1 << 16));
+        fill(&mut h, 1, 1, 20);
+        let syncs = io.stats().syncs;
+
+        io.fail_next_sync();
+        let (a2, r2) = ack_chan();
+        let (a3, r3) = ack_chan();
+        submit(&mut h, entry_op(2, Some(a2)));
+        submit(&mut h, entry_op(3, Some(a3)));
+        assert!(wait(&r2).is_err());
+        assert!(wait(&r3).is_err());
+        assert!(h.is_failed());
+        let writes = io.stats().writes;
+
+        // The thread is still alive and answers later ops with Err, without touching the disk.
+        assert!(op_wait(&mut h, |ack| entry_op(4, ack)).is_err());
+        assert!(op_wait(&mut h, |ack| WalOp::Vote { blob: vec![1], ack }).is_err());
+        assert_eq!(io.stats().syncs, syncs, "no sync after the failed one, and never a retry");
+        assert_eq!(io.stats().writes, writes);
+        h.shutdown();
+    }
+
+    enum TestPayload {
+        Data(Vec<u8>),
+        Boom,
+    }
+
+    impl WalPayload for TestPayload {
+        fn encode_into(&self, out: &mut Vec<u8>) {
+            match self {
+                TestPayload::Data(v) => out.extend_from_slice(v),
+                TestPayload::Boom => panic!("boom in encode_into"),
+            }
+        }
+    }
+
+    #[test]
+    fn panicking_payload_completes_every_ack_with_err() {
+        let io = FakeIo::new();
+        let mut h = WalHandle::<TestPayload>::spawn(
+            Box::new(io.clone()),
+            cfg(1 << 16),
+            WalStart::fresh(),
+            Box::new(NoopObserver),
+        )
+        .unwrap();
+        let (a1, r1) = ack_chan();
+        let (a2, r2) = ack_chan();
+        let (a3, r3) = ack_chan();
+        submit(&mut h, WalOp::Entry { index: 1, payload: TestPayload::Data(vec![1]), ack: Some(a1) });
+        submit(&mut h, WalOp::Entry { index: 2, payload: TestPayload::Boom, ack: Some(a2) });
+        submit(&mut h, WalOp::Entry { index: 3, payload: TestPayload::Data(vec![3]), ack: Some(a3) });
+        // Entry 1 may have been committed in its own batch; either way no ack is orphaned.
+        let _ = wait(&r1);
+        assert!(wait(&r2).is_err());
+        assert!(wait(&r3).is_err());
+        assert!(h.is_failed());
+        let (a4, r4) = ack_chan();
+        submit(&mut h, WalOp::Entry { index: 4, payload: TestPayload::Data(vec![4]), ack: Some(a4) });
+        assert!(wait(&r4).is_err());
+        h.shutdown();
+    }
+
+    #[derive(Clone, Default)]
+    struct Capture(Arc<parking_lot::Mutex<Vec<u8>>>);
+
+    impl io::Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
+        type Writer = Capture;
+        fn make_writer(&'a self) -> Capture {
+            self.clone()
+        }
+    }
+
+    fn spawn_logged(config: WalConfig) -> (WalHandle<Vec<u8>>, FakeIo, String) {
+        let capture = Capture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .finish();
+        let (h, io) = tracing::subscriber::with_default(subscriber, || spawn_fake(config));
+        let text = String::from_utf8_lossy(&capture.0.lock()).into_owned();
+        (h, io, text)
+    }
+
+    #[test]
+    fn fsync_never_acks_after_write_without_any_sync_and_warns() {
+        let config = WalConfig {
+            fsync: Fsync::Never,
+            ..cfg(1 << 16)
+        };
+        let (mut h, io, log) = spawn_logged(config);
+        assert!(log.contains("UNSAFE"), "missing startup warning: {log:?}");
+        fill(&mut h, 1, 10, 30);
+        assert_eq!(io.stats().syncs, 0);
+        let stats = h.stats();
+        h.shutdown();
+        assert_eq!(io.stats().syncs, 0);
+        assert_eq!(io.stats().dir_syncs, 0);
+        assert_eq!(stats.syncs.load(Ordering::Relaxed), 0);
+        assert_eq!(seg_entries(&io.segment_bytes(1)), (1..=10).collect::<Vec<u64>>());
+    }
+
+    #[test]
+    fn fsync_periodic_syncs_at_most_once_per_interval_and_warns() {
+        let hour = WalConfig {
+            fsync: Fsync::Periodic { interval_ms: 3_600_000 },
+            ..cfg(1 << 16)
+        };
+        let (mut h, io, log) = spawn_logged(hour);
+        assert!(log.contains("UNSAFE"), "missing startup warning: {log:?}");
+        fill(&mut h, 1, 10, 30);
+        assert_eq!(io.stats().syncs, 0, "interval has not elapsed, acks follow the write");
+        h.shutdown();
+        assert!(io.stats().syncs <= 1, "at most the final shutdown sync");
+
+        let fast = WalConfig {
+            fsync: Fsync::Periodic { interval_ms: 20 },
+            ..cfg(1 << 16)
+        };
+        let (mut h, io) = spawn_fake(fast);
+        let started = Instant::now();
+        for i in 1..=100u64 {
+            op_wait(&mut h, |ack| entry_op(i, ack)).unwrap();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        h.shutdown();
+        let syncs = io.stats().syncs;
+        assert!(syncs >= 1, "periodic mode never synced");
+        assert!(syncs <= elapsed_ms / 20 + 3, "{syncs} syncs in {elapsed_ms} ms");
+
+        let (_h, _io, log) = spawn_logged(cfg(1 << 16));
+        assert!(!log.contains("UNSAFE"), "Always must not warn: {log:?}");
+    }
+
+    #[test]
+    fn no_lost_wakeup_stress() {
+        let (mut h, _io) = spawn_fake(cfg(1 << 20));
+        let mut x: u64 = 0x2545_F491_4F6C_DD1D;
+        for i in 1..=5000u64 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            std::thread::sleep(Duration::from_micros(x % 300));
+            op_wait(&mut h, |ack| entry_op(i, ack)).unwrap();
+        }
+        assert_eq!(h.stats().timeout_wakeups_with_work.load(Ordering::Relaxed), 0);
+        h.shutdown();
+    }
+
+    #[test]
+    fn ring_full_returns_op_back() {
+        let (mut h, io) = spawn_fake(cfg(1 << 20));
+        io.set_sync_delay(Duration::from_millis(300));
+        let mut i = 0u64;
+        let back = loop {
+            i += 1;
+            assert!(i < 40_000, "ring never filled");
+            if let Err(op) = h.try_submit(entry_op(i, None)) {
+                break op;
+            }
+        };
+        match back {
+            WalOp::Entry { index, payload, .. } => {
+                assert_eq!(index, i);
+                assert_eq!(payload, body(i, 8));
+            }
+            _ => panic!("wrong op returned"),
+        }
+        io.set_sync_delay(Duration::ZERO);
+        h.shutdown();
+    }
+
+    #[test]
+    fn dir_sync_failure_fails_roll_and_acks() {
+        let (mut h, io) = spawn_fake(cfg(4096));
+        fill(&mut h, 1, 1, 300);
+
+        io.fail_next_dir_sync();
+        let roll = op_wait(&mut h, |ack| WalOp::Entry { index: 2, payload: vec![1; 3900], ack });
+        assert!(roll.is_err(), "an entry in a segment whose dir entry is not durable was acked");
+        assert!(h.is_failed());
+        assert!(op_wait(&mut h, |ack| entry_op(3, ack)).is_err());
+        h.shutdown();
+
+        io.power_loss(0);
+        assert_eq!(segments(&io), vec![1], "the never dir-synced segment must not survive");
+        assert_eq!(seg_entries(&io.segment_bytes(1)), vec![1]);
+    }
 }
