@@ -9,7 +9,7 @@
 
 use crate::arena::{SlabBlock, SlabPool, MAX_BLOCK_SIZE};
 use crate::ipc::Consumer;
-use crate::storage::{CasError, KvIndex};
+use crate::storage::{AtStatus, CasError, KvIndex};
 use bytes::Bytes;
 
 /// Slab-backed value storage that returns its block to the pool on drop.
@@ -41,6 +41,26 @@ impl Drop for SlabValue {
 pub enum Command {
     Set { key: Bytes, value: Bytes },
     Delete { key: Bytes },
+}
+
+/// Result of a stamped (`*_at`) apply on the engine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApplyOutcome {
+    /// The entry was applied and the key stamped.
+    Applied,
+    /// The key's stamp was already at or above the entry's index (replay).
+    Skipped,
+    /// A CAS did not match; carries the observed value. Nothing was stamped.
+    CasFailed { current: Option<Bytes> },
+}
+
+impl From<AtStatus> for ApplyOutcome {
+    fn from(s: AtStatus) -> Self {
+        match s {
+            AtStatus::Applied => ApplyOutcome::Applied,
+            AtStatus::Skipped => ApplyOutcome::Skipped,
+        }
+    }
 }
 
 /// Node-local lock-free cache engine.
@@ -80,6 +100,11 @@ impl LocalEngine {
 
     pub fn delete(&self, key: &[u8]) -> bool {
         self.index.delete(key)
+    }
+
+    /// Apply a `set` as Raft entry `index`; skipped if already applied.
+    pub fn set_at(&self, index: u64, key: &[u8], value: &[u8]) -> ApplyOutcome {
+        self.index.put_at(key, self.materialize(value), index).into()
     }
 
     pub fn cas(
@@ -176,6 +201,17 @@ mod tests {
         }
         assert_eq!(e.get(&[2]).unwrap(), &[2u8, 2][..]);
         assert!(e.get(&[3]).is_none());
+    }
+
+    #[test]
+    fn test_engine_set_at_skips_replayed_index() {
+        let e = LocalEngine::new();
+        assert_eq!(e.set_at(4, b"k", b"first"), ApplyOutcome::Applied);
+        assert_eq!(e.set_at(4, b"k", b"again"), ApplyOutcome::Skipped);
+        assert_eq!(e.set_at(2, b"k", b"older"), ApplyOutcome::Skipped);
+        assert_eq!(e.get(b"k").unwrap(), &b"first"[..]);
+        assert_eq!(e.set_at(5, b"k", b"newer"), ApplyOutcome::Applied);
+        assert_eq!(e.get(b"k").unwrap(), &b"newer"[..]);
     }
 
     #[test]
