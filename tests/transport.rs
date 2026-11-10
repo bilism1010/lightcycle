@@ -15,13 +15,15 @@ use futures::{SinkExt, StreamExt};
 use lightcycle::net::client::{PeerClient, TcpNetConfig, TcpNetworkFactory};
 use lightcycle::net::handler::RaftHandler;
 use lightcycle::net::protocol::{
-    encode_body, WireAppendResult, APPEND_REQ, APPEND_RESP, SNAP_BEGIN, VOTE_REQ, VOTE_RESP,
+    decode_body, decode_snap_chunk, encode_body, encode_snap_chunk, SnapAck, SnapBegin,
+    WireAppendResult, APPEND_REQ, APPEND_RESP, SNAP_ACK, SNAP_BEGIN, SNAP_CHUNK, SNAP_END,
+    SNAP_RESP, VOTE_REQ, VOTE_RESP,
 };
 use lightcycle::net::server::PeerServer;
 use lightcycle::raft::types::{KvRequest, SnapshotFile, TypeConfig};
-use lightcycle::wire::frame::{Frame, FrameCodec, Lane};
+use lightcycle::wire::frame::{Frame, FrameCodec, Lane, KIND_ERROR};
 use lightcycle::wire::hello::{client_handshake, server_handshake, Hello};
-use openraft::errors::{Fatal, RPCError, RaftError};
+use openraft::errors::{Fatal, RPCError, RaftError, ReplicationClosed, StreamingError};
 use openraft::network::RPCOption;
 use openraft::raft::{
     AppendEntriesRequest, AppendResult, SnapshotResponse, VoteRequest, VoteResponse,
@@ -47,6 +49,27 @@ struct StubHandler {
     fail_votes: AtomicBool,
     append_delay: Duration,
     append_gate: Option<Arc<Semaphore>>,
+    /// Time `install_snapshot` takes after inspecting the received file.
+    install_delay: Duration,
+    /// `install_snapshot` calls started.
+    install_calls: AtomicUsize,
+    /// What each `install_snapshot` call saw (the file is removed afterwards, as a real
+    /// installer would consume it).
+    installed: std::sync::Mutex<Vec<Installed>>,
+}
+
+/// Observations made inside `install_snapshot`.
+#[derive(Debug)]
+struct Installed {
+    file_name: String,
+    parent: std::path::PathBuf,
+    len: u64,
+    /// Whole file, kept only up to 4 MiB.
+    contents: Vec<u8>,
+    crc: u32,
+    mode: Option<u32>,
+    /// File names in the parent directory at that moment.
+    siblings: Vec<String>,
 }
 
 impl StubHandler {
@@ -115,9 +138,19 @@ impl RaftHandler for StubHandler {
         &self,
         vote: VoteOf<TypeConfig>,
         _meta: SnapshotMetaOf<TypeConfig>,
-        _file: SnapshotFile,
+        file: SnapshotFile,
     ) -> BoxFuture<'static, Result<SnapshotResponse<TypeConfig>, Fatal<TypeConfig>>> {
-        Box::pin(async move { Ok(SnapshotResponse::new(vote)) })
+        self.install_calls.fetch_add(1, Ordering::SeqCst);
+        let delay = self.install_delay;
+        // Inspect and consume the file synchronously, as the real installer would take it over.
+        let observed = observe_received(&file);
+        self.installed.lock().unwrap().push(observed);
+        Box::pin(async move {
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+            Ok(SnapshotResponse::new(vote))
+        })
     }
 }
 
@@ -602,8 +635,8 @@ async fn unexpected_kinds_and_lane_mismatch_close_connection() {
         .unwrap();
     expect_closed(&mut framed).await;
 
-    // The snapshot lane is accepted and lane-counted, but every snapshot frame is unknown until
-    // plan 03-17.
+    // The snapshot lane is accepted and lane-counted; a SNAP_BEGIN whose body is not a SnapBegin
+    // is a decode error.
     let mut framed = raw_conn(&server, Lane::Snapshot).await;
     framed
         .send(Frame::new(SNAP_BEGIN, Lane::Snapshot, 1, Bytes::new()))
@@ -844,5 +877,838 @@ async fn handler_fatal_on_stream_maps_to_unreachable() {
         matches!(first, Err(RPCError::Unreachable(_))),
         "a stopped remote must surface as Unreachable, got {first:?}"
     );
+    server.shutdown().await;
+}
+
+// ---- snapshot lane (plan 03-17) -------------------------------------------------------------
+
+use std::path::Path;
+
+fn snap_vote() -> VoteOf<TypeConfig> {
+    VoteOf::<TypeConfig>::new_committed(3, 1)
+}
+
+fn snap_meta() -> SnapshotMetaOf<TypeConfig> {
+    openraft::SnapshotMeta {
+        last_log_id: Some(lid(5)),
+        last_membership: Default::default(),
+    }
+}
+
+/// Config for either end of a snapshot test. The client's chunk size must equal the server's
+/// (openraft's per-call `RPCOption` chunk size cannot be set from outside the crate, so the
+/// configured size is what the tests vary).
+fn snap_cfg(
+    node: u64,
+    recv_dir: &Path,
+    chunk: usize,
+    window: usize,
+    idle: Duration,
+) -> TcpNetConfig {
+    let mut cfg = TcpNetConfig::new(CLUSTER, node, recv_dir.to_path_buf());
+    cfg.snapshot_chunk_size = chunk;
+    cfg.snapshot_ack_window = window;
+    cfg.snapshot_idle_timeout = idle;
+    cfg
+}
+
+/// Write `len` non-repeating bytes to `dir/name`.
+fn make_file(dir: &Path, name: &str, len: usize) -> SnapshotFile {
+    let mut state = 0x9E37_79B9_7F4A_7C15u64 ^ len as u64;
+    let mut bytes = Vec::with_capacity(len + 8);
+    while bytes.len() < len {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        bytes.extend_from_slice(&state.to_le_bytes());
+    }
+    bytes.truncate(len);
+    let path = dir.join(name);
+    std::fs::write(&path, &bytes).unwrap();
+    SnapshotFile {
+        path,
+        len: len as u64,
+    }
+}
+
+fn snapshot_of(
+    file: SnapshotFile,
+) -> openraft::type_config::alias::SnapshotOf<TypeConfig, SnapshotFile> {
+    openraft::Snapshot {
+        meta: snap_meta(),
+        snapshot: file,
+    }
+}
+
+fn never_cancelled() -> impl std::future::Future<Output = ReplicationClosed> + Send + 'static {
+    futures::future::pending::<ReplicationClosed>()
+}
+
+/// Inspect the received file, then consume it (a real installer renames or removes it).
+fn observe_received(file: &SnapshotFile) -> Installed {
+    let meta = std::fs::metadata(&file.path).expect("received file exists");
+    let bytes = std::fs::read(&file.path).unwrap();
+    let parent = file.path.parent().unwrap().to_path_buf();
+    let siblings = dir_entries(&parent);
+    #[cfg(unix)]
+    let mode = {
+        use std::os::unix::fs::PermissionsExt;
+        Some(meta.permissions().mode() & 0o777)
+    };
+    #[cfg(not(unix))]
+    let mode = None;
+    let installed = Installed {
+        file_name: file.path.file_name().unwrap().to_string_lossy().into_owned(),
+        parent,
+        len: file.len.max(meta.len()),
+        crc: crc32c::crc32c(&bytes),
+        contents: if bytes.len() <= 4 * 1024 * 1024 {
+            bytes
+        } else {
+            Vec::new()
+        },
+        mode,
+        siblings,
+    };
+    std::fs::remove_file(&file.path).unwrap();
+    installed
+}
+
+/// Names in `dir`, sorted; empty when the directory does not exist.
+fn dir_entries(dir: &Path) -> Vec<String> {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = rd
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+async fn wait_dir_empty(dir: &Path) {
+    let dir = dir.to_path_buf();
+    eventually("receive directory to be empty", move || {
+        dir_entries(&dir).is_empty()
+    })
+    .await;
+}
+
+fn begin_frame(total_len: u64) -> Frame {
+    let begin = SnapBegin {
+        vote: snap_vote(),
+        meta: snap_meta(),
+        total_len,
+    };
+    Frame::new(SNAP_BEGIN, Lane::Snapshot, 1, encode_body(&begin).unwrap())
+}
+
+fn chunk_frame(offset: u64, len: usize) -> Frame {
+    Frame::new(
+        SNAP_CHUNK,
+        Lane::Snapshot,
+        1,
+        encode_snap_chunk(offset, &vec![0xAB; len]),
+    )
+}
+
+fn end_frame() -> Frame {
+    Frame::new(SNAP_END, Lane::Snapshot, 1, Bytes::new())
+}
+
+/// The server must answer with a KIND_ERROR frame and then close the connection.
+async fn expect_error_then_closed(framed: &mut Framed<TcpStream, FrameCodec>) {
+    let mut saw_error = false;
+    let closed = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match framed.next().await {
+                None | Some(Err(_)) => break,
+                Some(Ok(frame)) => saw_error |= frame.header.kind == KIND_ERROR,
+            }
+        }
+    })
+    .await;
+    assert!(closed.is_ok(), "server did not close the connection");
+    assert!(saw_error, "server did not report the violation");
+}
+
+const IDLE: Duration = Duration::from_secs(30);
+
+async fn start_snapshot_server(
+    stub: Arc<StubHandler>,
+    recv_dir: &Path,
+    chunk: usize,
+    window: usize,
+    idle: Duration,
+    tweak: impl FnOnce(&mut TcpNetConfig),
+) -> PeerServer {
+    start_server(stub, |cfg| {
+        *cfg = snap_cfg(SERVER_NODE, recv_dir, chunk, window, idle);
+        tweak(cfg);
+    })
+    .await
+}
+
+#[tokio::test]
+async fn snapshot_transfer_chunked_and_installed() {
+    let td = tempfile::tempdir().unwrap();
+    let recv_dir = td.path().join("recv");
+    let src = make_file(td.path(), "snap.bin", 3 * 1024 * 1024);
+    let expected = std::fs::read(&src.path).unwrap();
+    let chunk = 256 * 1024;
+
+    let stub = Arc::new(StubHandler::default());
+    let server = start_snapshot_server(stub.clone(), &recv_dir, chunk, 4, IDLE, |_| {}).await;
+    let mut peer = client(
+        &server,
+        snap_cfg(CLIENT_NODE, &recv_dir, chunk, 4, IDLE),
+        Lane::Snapshot,
+    )
+    .await;
+
+    let resp = peer
+        .full_snapshot(snap_vote(), snapshot_of(src), never_cancelled(), opt())
+        .await
+        .expect("snapshot transfer");
+    assert_eq!(resp.vote, snap_vote(), "the handler's response reaches the sender");
+
+    assert_eq!(stub.install_calls.load(Ordering::SeqCst), 1);
+    let installed = std::mem::take(&mut *stub.installed.lock().unwrap());
+    let got = &installed[0];
+    assert_eq!(got.contents, expected, "byte-identical");
+    assert_eq!(got.len, expected.len() as u64);
+    assert_eq!(got.parent, recv_dir, "file lives directly in recv_dir");
+    assert_eq!(got.siblings, vec![got.file_name.clone()], "no other file in recv_dir");
+    let digits = got
+        .file_name
+        .strip_prefix("recv-")
+        .and_then(|rest| rest.strip_suffix(".tmp"))
+        .expect("name is recv-<digits>.tmp");
+    assert!(!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()), "{digits}");
+    #[cfg(unix)]
+    assert_eq!(got.mode, Some(0o600));
+
+    let stats = server.stats();
+    assert_eq!(stats.snapshot_chunks.load(Ordering::Relaxed), 12);
+    assert_eq!(stats.accepted(Lane::Snapshot), 1);
+    assert_eq!(stats.accepted(Lane::Replication), 0);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn snapshot_connection_is_reusable_after_success() {
+    let td = tempfile::tempdir().unwrap();
+    let recv_dir = td.path().join("recv");
+    let chunk = 64 * 1024;
+    let stub = Arc::new(StubHandler::default());
+    let server = start_snapshot_server(stub.clone(), &recv_dir, chunk, 2, IDLE, |_| {}).await;
+    let mut peer = client(
+        &server,
+        snap_cfg(CLIENT_NODE, &recv_dir, chunk, 2, IDLE),
+        Lane::Snapshot,
+    )
+    .await;
+    for (i, len) in [0usize, 1, chunk, chunk + 1].into_iter().enumerate() {
+        let src = make_file(td.path(), &format!("s{i}.bin"), len);
+        peer.full_snapshot(snap_vote(), snapshot_of(src), never_cancelled(), opt())
+            .await
+            .unwrap_or_else(|e| panic!("snapshot of {len} bytes: {e:?}"));
+    }
+    assert_eq!(stub.install_calls.load(Ordering::SeqCst), 4);
+    assert_eq!(server.stats().accepted(Lane::Snapshot), 1, "one connection carried all four");
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn snapshot_bad_offset_rejected() {
+    let td = tempfile::tempdir().unwrap();
+    let recv_dir = td.path().join("recv");
+    let stub = Arc::new(StubHandler::default());
+    let server = start_snapshot_server(stub.clone(), &recv_dir, 64 * 1024, 4, IDLE, |_| {}).await;
+    let stats = server.stats();
+    let mut framed = raw_conn(&server, Lane::Snapshot).await;
+
+    framed.send(begin_frame(1000)).await.unwrap();
+    framed.send(chunk_frame(0, 100)).await.unwrap();
+    eventually("first chunk accepted", || {
+        stats.snapshot_chunks.load(Ordering::Relaxed) == 1
+    })
+    .await;
+    assert_eq!(dir_entries(&recv_dir).len(), 1, "a receive file exists mid-transfer");
+
+    // Overlaps the bytes already written.
+    framed.send(chunk_frame(50, 100)).await.unwrap();
+    expect_error_then_closed(&mut framed).await;
+    wait_dir_empty(&recv_dir).await;
+    assert_eq!(stub.install_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(stats.snapshot_chunks.load(Ordering::Relaxed), 1);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn snapshot_over_declared_size_rejected() {
+    let td = tempfile::tempdir().unwrap();
+    let recv_dir = td.path().join("recv");
+    let stub = Arc::new(StubHandler::default());
+    let server = start_snapshot_server(stub.clone(), &recv_dir, 64 * 1024, 4, IDLE, |_| {}).await;
+
+    // A chunk that runs past the declared total.
+    let mut framed = raw_conn(&server, Lane::Snapshot).await;
+    framed.send(begin_frame(100)).await.unwrap();
+    framed.send(chunk_frame(0, 101)).await.unwrap();
+    expect_error_then_closed(&mut framed).await;
+    wait_dir_empty(&recv_dir).await;
+
+    // A second chunk that crosses the total after a valid first one.
+    let mut framed = raw_conn(&server, Lane::Snapshot).await;
+    framed.send(begin_frame(100)).await.unwrap();
+    framed.send(chunk_frame(0, 60)).await.unwrap();
+    framed.send(chunk_frame(60, 41)).await.unwrap();
+    expect_error_then_closed(&mut framed).await;
+    wait_dir_empty(&recv_dir).await;
+
+    // END with fewer bytes than declared.
+    let mut framed = raw_conn(&server, Lane::Snapshot).await;
+    framed.send(begin_frame(100)).await.unwrap();
+    framed.send(chunk_frame(0, 60)).await.unwrap();
+    framed.send(end_frame()).await.unwrap();
+    expect_error_then_closed(&mut framed).await;
+    wait_dir_empty(&recv_dir).await;
+
+    assert_eq!(stub.install_calls.load(Ordering::SeqCst), 0);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn snapshot_begin_over_max_rejected() {
+    let td = tempfile::tempdir().unwrap();
+    let recv_dir = td.path().join("recv");
+    let stub = Arc::new(StubHandler::default());
+    let server = start_snapshot_server(stub.clone(), &recv_dir, 64 * 1024, 4, IDLE, |cfg| {
+        cfg.max_snapshot_bytes = 1000;
+    })
+    .await;
+
+    let mut framed = raw_conn(&server, Lane::Snapshot).await;
+    framed.send(begin_frame(1001)).await.unwrap();
+    expect_error_then_closed(&mut framed).await;
+    assert!(dir_entries(&recv_dir).is_empty(), "no tmp file was created");
+
+    // Exactly the maximum is fine.
+    let mut framed = raw_conn(&server, Lane::Snapshot).await;
+    framed.send(begin_frame(1000)).await.unwrap();
+    let stats = server.stats();
+    framed.send(chunk_frame(0, 1000)).await.unwrap();
+    framed.send(end_frame()).await.unwrap();
+    let resp = tokio::time::timeout(Duration::from_secs(2), framed.next())
+        .await
+        .expect("response in time")
+        .expect("open")
+        .expect("frame");
+    assert_eq!(resp.header.kind, SNAP_RESP);
+    assert_eq!(stub.install_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(stats.snapshot_chunks.load(Ordering::Relaxed), 1);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn snapshot_second_begin_rejected() {
+    let td = tempfile::tempdir().unwrap();
+    let recv_dir = td.path().join("recv");
+    let stub = Arc::new(StubHandler::default());
+    let server = start_snapshot_server(stub.clone(), &recv_dir, 64 * 1024, 4, IDLE, |_| {}).await;
+    let stats = server.stats();
+    let mut framed = raw_conn(&server, Lane::Snapshot).await;
+
+    framed.send(begin_frame(1000)).await.unwrap();
+    framed.send(chunk_frame(0, 100)).await.unwrap();
+    eventually("chunk accepted", || {
+        stats.snapshot_chunks.load(Ordering::Relaxed) == 1
+    })
+    .await;
+    assert_eq!(dir_entries(&recv_dir).len(), 1);
+    framed.send(begin_frame(1000)).await.unwrap();
+    expect_closed(&mut framed).await;
+    wait_dir_empty(&recv_dir).await;
+    assert_eq!(stats.decode_errors.load(Ordering::Relaxed), 1);
+    assert_eq!(stub.install_calls.load(Ordering::SeqCst), 0);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn snapshot_early_close_removes_tmp() {
+    let td = tempfile::tempdir().unwrap();
+    let recv_dir = td.path().join("recv");
+    let stub = Arc::new(StubHandler::default());
+    let server = start_snapshot_server(stub.clone(), &recv_dir, 64 * 1024, 4, IDLE, |_| {}).await;
+    let stats = server.stats();
+    let mut framed = raw_conn(&server, Lane::Snapshot).await;
+
+    framed.send(begin_frame(1000)).await.unwrap();
+    framed.send(chunk_frame(0, 100)).await.unwrap();
+    eventually("chunk accepted", || {
+        stats.snapshot_chunks.load(Ordering::Relaxed) == 1
+    })
+    .await;
+    assert_eq!(dir_entries(&recv_dir).len(), 1);
+    drop(framed);
+    wait_dir_empty(&recv_dir).await;
+    assert_eq!(stub.install_calls.load(Ordering::SeqCst), 0);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn snapshot_server_shutdown_removes_tmp() {
+    let td = tempfile::tempdir().unwrap();
+    let recv_dir = td.path().join("recv");
+    let stub = Arc::new(StubHandler::default());
+    let server = start_snapshot_server(stub.clone(), &recv_dir, 64 * 1024, 4, IDLE, |_| {}).await;
+    let stats = server.stats();
+    let mut framed = raw_conn(&server, Lane::Snapshot).await;
+    framed.send(begin_frame(1000)).await.unwrap();
+    framed.send(chunk_frame(0, 100)).await.unwrap();
+    eventually("chunk accepted", || {
+        stats.snapshot_chunks.load(Ordering::Relaxed) == 1
+    })
+    .await;
+    server.shutdown().await;
+    wait_dir_empty(&recv_dir).await;
+}
+
+/// A receiver that never acknowledges (its window is far larger than the sender's) keeps a
+/// partial file on the server and stalls the sender after its window.
+struct Stalled {
+    server: PeerServer,
+    recv_dir: std::path::PathBuf,
+    stub: Arc<StubHandler>,
+    src: SnapshotFile,
+    _td: tempfile::TempDir,
+}
+
+async fn stalled_receiver() -> Stalled {
+    let td = tempfile::tempdir().unwrap();
+    let recv_dir = td.path().join("recv");
+    let src = make_file(td.path(), "snap.bin", 1024 * 1024);
+    let stub = Arc::new(StubHandler::default());
+    // Server acks every 100 chunks; the 16-chunk snapshot never earns an ack.
+    let server = start_snapshot_server(stub.clone(), &recv_dir, 64 * 1024, 100, IDLE, |_| {}).await;
+    Stalled {
+        server,
+        recv_dir,
+        stub,
+        src,
+        _td: td,
+    }
+}
+
+#[tokio::test]
+async fn snapshot_cancel_aborts_and_removes_tmp() {
+    let s = stalled_receiver().await;
+    let stats = s.server.stats();
+    let mut peer = client(
+        &s.server,
+        snap_cfg(CLIENT_NODE, &s.recv_dir, 64 * 1024, 2, IDLE),
+        Lane::Snapshot,
+    )
+    .await;
+
+    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+    let cancel = async move {
+        let _ = cancel_rx.await;
+        ReplicationClosed::new("test cancel")
+    };
+    let src = s.src.clone();
+    let task = tokio::spawn(async move {
+        peer.full_snapshot(snap_vote(), snapshot_of(src), cancel, opt())
+            .await
+    });
+
+    // The sender sends its window of 2 chunks, then waits for an ack that never comes.
+    eventually("two chunks received", || {
+        stats.snapshot_chunks.load(Ordering::Relaxed) == 2
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!task.is_finished(), "sender is blocked on the ack window");
+    assert_eq!(stats.snapshot_chunks.load(Ordering::Relaxed), 2, "window respected");
+    assert_eq!(dir_entries(&s.recv_dir).len(), 1);
+
+    let started = Instant::now();
+    cancel_tx.send(()).unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(1), task)
+        .await
+        .expect("cancel is prompt")
+        .unwrap();
+    assert!(
+        matches!(result, Err(StreamingError::Closed(_))),
+        "got {result:?}"
+    );
+    assert!(started.elapsed() < Duration::from_millis(500));
+    wait_dir_empty(&s.recv_dir).await;
+    assert_eq!(s.stub.install_calls.load(Ordering::SeqCst), 0);
+    s.server.shutdown().await;
+}
+
+#[tokio::test]
+async fn snapshot_idle_timeout_cleans_up() {
+    // Sender side: a receiver that stops acking makes the client fail with Timeout.
+    let s = stalled_receiver().await;
+    let mut peer = client(
+        &s.server,
+        snap_cfg(CLIENT_NODE, &s.recv_dir, 64 * 1024, 2, Duration::from_millis(200)),
+        Lane::Snapshot,
+    )
+    .await;
+    let started = Instant::now();
+    let err = peer
+        .full_snapshot(snap_vote(), snapshot_of(s.src.clone()), never_cancelled(), opt())
+        .await
+        .expect_err("no acks, no completion");
+    assert!(matches!(err, StreamingError::Timeout(_)), "got {err:?}");
+    assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+    // The failed client dropped its connection; the server removed the partial file.
+    wait_dir_empty(&s.recv_dir).await;
+    s.server.shutdown().await;
+
+    // Receiver side: a sender that stalls mid-transfer is closed and cleaned up.
+    let td = tempfile::tempdir().unwrap();
+    let recv_dir = td.path().join("recv");
+    let stub = Arc::new(StubHandler::default());
+    let server = start_snapshot_server(
+        stub.clone(),
+        &recv_dir,
+        64 * 1024,
+        4,
+        Duration::from_millis(200),
+        |_| {},
+    )
+    .await;
+    let stats = server.stats();
+    let mut framed = raw_conn(&server, Lane::Snapshot).await;
+    framed.send(begin_frame(1000)).await.unwrap();
+    framed.send(chunk_frame(0, 100)).await.unwrap();
+    eventually("chunk accepted", || {
+        stats.snapshot_chunks.load(Ordering::Relaxed) == 1
+    })
+    .await;
+    assert_eq!(dir_entries(&recv_dir).len(), 1);
+    // Say nothing more; the server must give up on its own.
+    expect_closed(&mut framed).await;
+    wait_dir_empty(&recv_dir).await;
+    assert_eq!(stub.install_calls.load(Ordering::SeqCst), 0);
+    server.shutdown().await;
+}
+
+/// Counters from the scripted receiver below.
+#[derive(Default)]
+struct FakeReceiver {
+    chunks: AtomicUsize,
+    max_unacked: AtomicUsize,
+    /// A chunk arrived while the receiver was holding back an ack the sender was owed.
+    overran_window: AtomicBool,
+}
+
+/// A receiver that acknowledges every `window` chunks only after `ack_delay`, and reports whether
+/// any further chunk arrives during that delay (a sender honouring the window sends none).
+async fn fake_receiver(
+    window: usize,
+    ack_delay: Duration,
+) -> (std::net::SocketAddr, Arc<FakeReceiver>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let fake = Arc::new(FakeReceiver::default());
+    let counters = fake.clone();
+    tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut framed = Framed::new(socket, FrameCodec::new(4096));
+        server_handshake(&mut framed, CLUSTER, SERVER_NODE, Duration::from_secs(2))
+            .await
+            .expect("hello");
+        framed.codec_mut().set_max_frame_length(1 << 20);
+        let (mut unacked, mut written) = (0usize, 0u64);
+        let mut vote = snap_vote();
+        let mut held: Option<Frame> = None;
+        loop {
+            let frame = match held.take() {
+                Some(frame) => frame,
+                None => match framed.next().await {
+                    Some(Ok(frame)) => frame,
+                    _ => return,
+                },
+            };
+            let req_id = frame.header.req_id;
+            match frame.header.kind {
+                SNAP_BEGIN => vote = decode_body::<SnapBegin>(&frame.body).unwrap().vote,
+                SNAP_CHUNK => {
+                    let (_, bytes) = decode_snap_chunk(&frame.body).unwrap();
+                    written += bytes.len() as u64;
+                    unacked += 1;
+                    counters.chunks.fetch_add(1, Ordering::SeqCst);
+                    counters.max_unacked.fetch_max(unacked, Ordering::SeqCst);
+                    if unacked == window {
+                        match tokio::time::timeout(ack_delay, framed.next()).await {
+                            Err(_) => {}
+                            Ok(Some(Ok(next))) if next.header.kind == SNAP_END => {
+                                // The final window needs no ack.
+                                held = Some(next);
+                                continue;
+                            }
+                            Ok(Some(Ok(_))) => {
+                                counters.overran_window.store(true, Ordering::SeqCst);
+                                return;
+                            }
+                            Ok(_) => return,
+                        }
+                        unacked = 0;
+                        let ack = Frame::new(
+                            SNAP_ACK,
+                            Lane::Snapshot,
+                            req_id,
+                            encode_body(&SnapAck { written }).unwrap(),
+                        );
+                        framed.send(ack).await.unwrap();
+                    }
+                }
+                SNAP_END => {
+                    let resp = SnapshotResponse::<TypeConfig>::new(vote);
+                    let reply = Frame::new(SNAP_RESP, Lane::Snapshot, req_id, encode_body(&resp).unwrap());
+                    framed.send(reply).await.unwrap();
+                }
+                other => panic!("unexpected frame kind {other}"),
+            }
+        }
+    });
+    (addr, fake)
+}
+
+async fn client_to(addr: std::net::SocketAddr, cfg: TcpNetConfig) -> PeerClient {
+    let node = BasicNode::new(addr.to_string());
+    TcpNetworkFactory::new(cfg)
+        .new_snapshot_client(SERVER_NODE, &node)
+        .await
+}
+
+#[tokio::test]
+async fn snapshot_ack_window_bounds_outstanding_chunks() {
+    let td = tempfile::tempdir().unwrap();
+    let src = make_file(td.path(), "snap.bin", 8 * 64 * 1024);
+    let (addr, fake) = fake_receiver(2, Duration::from_millis(100)).await;
+    let mut peer = client_to(addr, snap_cfg(CLIENT_NODE, td.path(), 64 * 1024, 2, IDLE)).await;
+
+    peer.full_snapshot(snap_vote(), snapshot_of(src), never_cancelled(), opt())
+        .await
+        .expect("transfer completes");
+    assert_eq!(fake.chunks.load(Ordering::SeqCst), 8);
+    assert_eq!(fake.max_unacked.load(Ordering::SeqCst), 2, "never above the window");
+    assert!(
+        !fake.overran_window.load(Ordering::SeqCst),
+        "no chunk was sent while an ack was owed"
+    );
+}
+
+#[tokio::test]
+async fn snapshot_idle_timeout_is_per_chunk_not_total() {
+    let td = tempfile::tempdir().unwrap();
+    let src = make_file(td.path(), "snap.bin", 8 * 64 * 1024);
+    // Four acknowledgements, each 250 ms late: about a second in total against a 400 ms idle bound.
+    let (addr, _fake) = fake_receiver(2, Duration::from_millis(250)).await;
+    let idle = Duration::from_millis(400);
+    let mut peer = client_to(addr, snap_cfg(CLIENT_NODE, td.path(), 64 * 1024, 2, idle)).await;
+
+    let started = Instant::now();
+    peer.full_snapshot(snap_vote(), snapshot_of(src), never_cancelled(), opt())
+        .await
+        .expect("each wait is within the idle bound");
+    assert!(
+        started.elapsed() > idle,
+        "the whole transfer outlasted the idle bound ({:?})",
+        started.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn snapshot_handler_failure_removes_tmp_and_reports() {
+    struct Failing;
+    impl RaftHandler for Failing {
+        fn append_entries(
+            &self,
+            _req: AppendEntriesRequest<TypeConfig>,
+        ) -> BoxFuture<'static, Result<AppendResult<TypeConfig>, RaftError<TypeConfig>>> {
+            Box::pin(async { Err(RaftError::Fatal(Fatal::Stopped)) })
+        }
+        fn stream_append(
+            &self,
+            reqs: BoxStream<'static, AppendEntriesRequest<TypeConfig>>,
+        ) -> BoxStream<'static, Result<AppendResult<TypeConfig>, Fatal<TypeConfig>>> {
+            reqs.map(|_| Err(Fatal::Stopped)).boxed()
+        }
+        fn vote(
+            &self,
+            _req: VoteRequest<TypeConfig>,
+        ) -> BoxFuture<'static, Result<VoteResponse<TypeConfig>, RaftError<TypeConfig>>> {
+            Box::pin(async { Err(RaftError::Fatal(Fatal::Stopped)) })
+        }
+        fn pre_vote(
+            &self,
+            _req: VoteRequest<TypeConfig>,
+        ) -> BoxFuture<'static, Result<VoteResponse<TypeConfig>, RaftError<TypeConfig>>> {
+            Box::pin(async { Err(RaftError::Fatal(Fatal::Stopped)) })
+        }
+        fn install_snapshot(
+            &self,
+            _vote: VoteOf<TypeConfig>,
+            _meta: SnapshotMetaOf<TypeConfig>,
+            _file: SnapshotFile,
+        ) -> BoxFuture<'static, Result<SnapshotResponse<TypeConfig>, Fatal<TypeConfig>>> {
+            Box::pin(async { Err(Fatal::Stopped) })
+        }
+    }
+
+    let td = tempfile::tempdir().unwrap();
+    let recv_dir = td.path().join("recv");
+    let src = make_file(td.path(), "snap.bin", 100 * 1024);
+    let server = start_server(Arc::new(Failing), |cfg| {
+        *cfg = snap_cfg(SERVER_NODE, &recv_dir, 64 * 1024, 4, IDLE);
+    })
+    .await;
+    let mut peer = client(
+        &server,
+        snap_cfg(CLIENT_NODE, &recv_dir, 64 * 1024, 4, IDLE),
+        Lane::Snapshot,
+    )
+    .await;
+    let err = peer
+        .full_snapshot(snap_vote(), snapshot_of(src), never_cancelled(), opt())
+        .await
+        .expect_err("handler stopped");
+    assert!(matches!(err, StreamingError::Unreachable(_)), "got {err:?}");
+    wait_dir_empty(&recv_dir).await;
+    server.shutdown().await;
+}
+
+// ---- heartbeat lane --------------------------------------------------------------------------
+
+#[tokio::test]
+async fn heartbeat_lane_uses_own_connection() {
+    let stub = Arc::new(StubHandler::default());
+    let server = start_server(stub.clone(), |_| {}).await;
+    let stats = server.stats();
+    let node = BasicNode::new(server.local_addr().to_string());
+    let mut factory = TcpNetworkFactory::new(config(CLUSTER, CLIENT_NODE));
+    let mut replication = factory.new_client(SERVER_NODE, &node).await;
+    let mut heartbeat = factory.new_heartbeat_client(SERVER_NODE, &node).await;
+    assert_eq!(replication.lane(), Lane::Replication);
+    assert_eq!(heartbeat.lane(), Lane::Heartbeat);
+
+    assert!(replication.vote(vote_req(), opt()).await.unwrap().vote_granted);
+    assert!(heartbeat.vote(vote_req(), opt()).await.unwrap().vote_granted);
+    assert!(heartbeat.pre_vote(vote_req(), opt()).await.unwrap().vote_granted);
+    assert!(replication.pre_vote(vote_req(), opt()).await.unwrap().vote_granted);
+
+    // Exactly one connection per lane, however many calls each made.
+    assert_eq!(stats.accepted(Lane::Replication), 1);
+    assert_eq!(stats.accepted(Lane::Heartbeat), 1);
+    assert_eq!(stats.accepted(Lane::Snapshot), 0);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn heartbeat_lane_pipelines_like_replication() {
+    let stub = Arc::new(StubHandler::with_appends(Duration::from_millis(10), None));
+    let server = start_server(stub, |_| {}).await;
+    let stats = server.stats();
+    let mut peer = client(&server, config(CLUSTER, CLIENT_NODE), Lane::Heartbeat).await;
+
+    let reqs: Vec<_> = (0..12).map(append_req).collect();
+    let mut out = peer
+        .stream_append(futures::stream::iter(reqs), opt())
+        .await
+        .expect("stream established");
+    let mut seen = Vec::new();
+    while let Some(item) = out.next().await {
+        seen.push(echoed(item.expect("response")));
+    }
+    assert_eq!(seen, (0..12).collect::<Vec<u64>>(), "responses in request order");
+    assert!(stats.max_inflight_observed.load(Ordering::Relaxed) >= 2, "pipelined");
+    assert_eq!(stats.accepted(Lane::Heartbeat), 1);
+    assert_eq!(stats.accepted(Lane::Replication), 0);
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn snapshot_does_not_starve_heartbeat() {
+    let td = tempfile::tempdir().unwrap();
+    let recv_dir = td.path().join("recv");
+    let src = make_file(td.path(), "big.bin", 32 * 1024 * 1024);
+    let src_crc = crc32c::crc32c(&std::fs::read(&src.path).unwrap());
+    let stub = Arc::new(StubHandler {
+        install_delay: Duration::from_millis(300),
+        ..Default::default()
+    });
+    let server = start_server(stub.clone(), |cfg| cfg.recv_dir = recv_dir.clone()).await;
+    let stats = server.stats();
+    let mut cfg = config(CLUSTER, CLIENT_NODE);
+    cfg.recv_dir = recv_dir.clone();
+
+    let mut snapshot_peer = client(&server, cfg.clone(), Lane::Snapshot).await;
+    let mut heartbeat_peer = client(&server, cfg, Lane::Heartbeat).await;
+
+    let done = Arc::new(AtomicBool::new(false));
+    let done_flag = done.clone();
+    let snapshot_task = tokio::spawn(async move {
+        let result = snapshot_peer
+            .full_snapshot(snap_vote(), snapshot_of(src), never_cancelled(), opt())
+            .await;
+        done_flag.store(true, Ordering::SeqCst);
+        result
+    });
+
+    // Heartbeat session: one request every 10 ms, round trip measured per request.
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<AppendEntriesRequest<TypeConfig>>();
+    let input = futures::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|req| (req, rx))
+    })
+    .boxed();
+    let mut out = heartbeat_peer
+        .stream_append(input, opt())
+        .await
+        .expect("heartbeat stream");
+
+    eventually("snapshot connection to be accepted", || {
+        stats.accepted(Lane::Snapshot) == 1
+    })
+    .await;
+    let mut rtts = Vec::new();
+    let mut index = 0u64;
+    while !done.load(Ordering::SeqCst) {
+        let sent = Instant::now();
+        tx.send(append_req(index)).unwrap();
+        let item = out.next().await.expect("heartbeat response").expect("accepted");
+        assert_eq!(echoed(item), index);
+        rtts.push(sent.elapsed());
+        index += 1;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    snapshot_task.await.unwrap().expect("snapshot installed");
+
+    assert_eq!(stub.install_calls.load(Ordering::SeqCst), 1);
+    {
+        let installed = stub.installed.lock().unwrap();
+        assert_eq!(installed[0].len, 32 * 1024 * 1024);
+        assert_eq!(installed[0].crc, src_crc, "32 MiB arrived intact");
+    }
+    // Structural fact: the lanes used distinct connections.
+    assert_eq!(stats.accepted(Lane::Heartbeat), 1);
+    assert_eq!(stats.accepted(Lane::Snapshot), 1);
+    assert_eq!(stats.accepted(Lane::Replication), 0);
+
+    // Timing: deliberately loose bounds to stay stable on shared machines; a heartbeat stuck
+    // behind the snapshot would wait for the whole 300 ms install, far above both.
+    assert!(rtts.len() >= 10, "heartbeats overlapped the snapshot ({} samples)", rtts.len());
+    rtts.sort();
+    let median = rtts[rtts.len() / 2];
+    let max = *rtts.last().unwrap();
+    assert!(max < Duration::from_millis(250), "max heartbeat round trip {max:?}");
+    assert!(median < Duration::from_millis(20), "median heartbeat round trip {median:?}");
     server.shutdown().await;
 }
