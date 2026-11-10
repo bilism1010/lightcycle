@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use futures::stream::{BoxStream, SplitSink};
 use futures::{SinkExt, StreamExt};
-use openraft::errors::Fatal;
+use openraft::errors::{Fatal, RaftError};
 use openraft::raft::{AppendEntriesRequest, AppendResult, VoteRequest};
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
@@ -219,6 +219,15 @@ async fn writer_task(mut sink: ConnSink, mut rx: mpsc::Receiver<Frame>, cancel: 
     }
 }
 
+/// A vote or pre-vote handler failure. `RaftError` with the default `Infallible` API error can
+/// only be `Fatal` (the node has stopped), so the peer is told to back off, as for AppendEntries.
+fn vote_failure(e: RaftError<TypeConfig>) -> RemoteFailure {
+    match e {
+        RaftError::Fatal(f) => RemoteFailure::new(true, f.to_string()),
+        RaftError::APIError(never) => match never {},
+    }
+}
+
 fn error_frame(lane: Lane, req_id: u64, failure: &RemoteFailure) -> Frame {
     Frame::new(KIND_ERROR, lane, req_id, failure.encode())
 }
@@ -401,11 +410,7 @@ async fn run_lane(
                                 &RemoteFailure::new(false, e.to_string()),
                             ),
                         },
-                        Err(e) => error_frame(
-                            lane,
-                            req_id,
-                            &RemoteFailure::new(false, e.to_string()),
-                        ),
+                        Err(e) => error_frame(lane, req_id, &vote_failure(e)),
                     };
                     let _ = out.send(reply).await;
                 });

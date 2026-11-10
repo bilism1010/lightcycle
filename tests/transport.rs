@@ -235,19 +235,66 @@ async fn prevote_and_vote_work_on_every_voting_lane() {
 }
 
 #[tokio::test]
-async fn handler_error_is_network_and_keeps_connection() {
+async fn stopped_remote_on_vote_is_unreachable_and_the_next_call_redials() {
+    // The vote handler can only fail with Fatal (the node stopped), which backs the caller off.
     let stub = Arc::new(StubHandler::default());
     let server = start_server(stub.clone(), |_| {}).await;
     let mut peer = client(&server, config(CLUSTER, CLIENT_NODE), Lane::Replication).await;
 
     stub.fail_votes.store(true, Ordering::SeqCst);
     let err = peer.vote(vote_req(), opt()).await.expect_err("handler fails");
-    assert!(matches!(err, RPCError::Network(_)), "got {err:?}");
+    assert!(matches!(err, RPCError::Unreachable(_)), "got {err:?}");
 
     stub.fail_votes.store(false, Ordering::SeqCst);
-    peer.vote(vote_req(), opt()).await.expect("connection still usable");
-    assert_eq!(server.stats().accepted(Lane::Replication), 1, "no reconnect");
+    peer.vote(vote_req(), opt()).await.expect("the next call dials afresh");
+    assert_eq!(server.stats().accepted(Lane::Replication), 2, "fatal drops the connection");
     server.shutdown().await;
+}
+
+#[tokio::test]
+async fn non_fatal_remote_failure_is_network_and_keeps_connection() {
+    // A hand-rolled peer that answers the first vote with a non-fatal KIND_ERROR frame.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let accepts = Arc::new(AtomicUsize::new(0));
+    let seen = accepts.clone();
+    tokio::spawn(async move {
+        while let Ok((socket, _)) = listener.accept().await {
+            seen.fetch_add(1, Ordering::SeqCst);
+            let mut framed = Framed::new(socket, FrameCodec::new(4096));
+            if server_handshake(&mut framed, CLUSTER, SERVER_NODE, Duration::from_secs(2))
+                .await
+                .is_err()
+            {
+                continue;
+            }
+            framed.codec_mut().set_max_frame_length(1 << 20);
+            let mut first = true;
+            while let Some(Ok(req)) = framed.next().await {
+                let id = req.header.req_id;
+                let reply = if first {
+                    first = false;
+                    let failure = lightcycle::net::protocol::RemoteFailure::new(false, "refused");
+                    Frame::new(KIND_ERROR, Lane::Replication, id, failure.encode())
+                } else {
+                    let resp: VoteResponse<TypeConfig> =
+                        VoteResponse::new(VoteOf::<TypeConfig>::new(2, 1), None, true);
+                    Frame::new(VOTE_RESP, Lane::Replication, id, encode_body(&resp).unwrap())
+                };
+                if framed.send(reply).await.is_err() {
+                    break;
+                }
+            }
+        }
+    });
+
+    let node = BasicNode::new(addr.to_string());
+    let mut factory = TcpNetworkFactory::new(config(CLUSTER, CLIENT_NODE));
+    let mut peer = factory.new_client(SERVER_NODE, &node).await;
+    let err = peer.vote(vote_req(), opt()).await.expect_err("remote refuses");
+    assert!(matches!(err, RPCError::Network(_)), "got {err:?}");
+    peer.vote(vote_req(), opt()).await.expect("connection still usable");
+    assert_eq!(accepts.load(Ordering::SeqCst), 1, "no reconnect");
 }
 
 #[tokio::test]
