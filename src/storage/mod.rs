@@ -2,4 +2,4 @@
 
 pub mod index;
 
-pub use index::{CasError, KvIndex};
+pub use index::{AtStatus, CasError, KvIndex, VersionedEntry};

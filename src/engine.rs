@@ -9,7 +9,7 @@
 
 use crate::arena::{SlabBlock, SlabPool, MAX_BLOCK_SIZE};
 use crate::ipc::Consumer;
-use crate::storage::{CasError, KvIndex};
+use crate::storage::{AtStatus, CasError, KvIndex, VersionedEntry};
 use bytes::Bytes;
 
 /// Slab-backed value storage that returns its block to the pool on drop.
@@ -41,6 +41,26 @@ impl Drop for SlabValue {
 pub enum Command {
     Set { key: Bytes, value: Bytes },
     Delete { key: Bytes },
+}
+
+/// Result of a stamped (`*_at`) apply on the engine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApplyOutcome {
+    /// The entry was applied and the key stamped.
+    Applied,
+    /// The key's stamp was already at or above the entry's index (replay).
+    Skipped,
+    /// A CAS did not match; carries the observed value. Nothing was stamped.
+    CasFailed { current: Option<Bytes> },
+}
+
+impl From<AtStatus> for ApplyOutcome {
+    fn from(s: AtStatus) -> Self {
+        match s {
+            AtStatus::Applied => ApplyOutcome::Applied,
+            AtStatus::Skipped => ApplyOutcome::Skipped,
+        }
+    }
 }
 
 /// Node-local lock-free cache engine.
@@ -80,6 +100,44 @@ impl LocalEngine {
 
     pub fn delete(&self, key: &[u8]) -> bool {
         self.index.delete(key)
+    }
+
+    /// Apply a `set` as Raft entry `index`; skipped if already applied.
+    pub fn set_at(&self, index: u64, key: &[u8], value: &[u8]) -> ApplyOutcome {
+        self.index.put_at(key, self.materialize(value), index).into()
+    }
+
+    /// Apply a `delete` as Raft entry `index`; writes a stamped tombstone.
+    pub fn delete_at(&self, index: u64, key: &[u8]) -> ApplyOutcome {
+        self.index.delete_at(key, index).into()
+    }
+
+    /// Apply a compare-and-swap as Raft entry `index`.
+    pub fn cas_at(
+        &self,
+        index: u64,
+        key: &[u8],
+        expected: Option<&[u8]>,
+        desired: Option<&[u8]>,
+    ) -> ApplyOutcome {
+        match self.index.cas_at(key, expected, desired.map(|v| self.materialize(v)), index) {
+            Ok(status) => status.into(),
+            Err(CasError::Mismatch { current }) => ApplyOutcome::CasFailed { current },
+        }
+    }
+
+    /// Fuzzy stamped scan for snapshots; see [`KvIndex::scan_versioned`].
+    pub fn scan_versioned(
+        &self,
+        drop_tombstones_at_or_below: u64,
+        f: impl FnMut(VersionedEntry),
+    ) {
+        self.index.scan_versioned(drop_tombstones_at_or_below, f);
+    }
+
+    /// Restore one scanned record into a fresh engine (single-threaded).
+    pub fn load_record(&self, key: &[u8], value: Option<&[u8]>, stamp: u64) {
+        self.index.load_versioned(key, value.map(|v| self.materialize(v)), stamp);
     }
 
     pub fn cas(
@@ -176,6 +234,125 @@ mod tests {
         }
         assert_eq!(e.get(&[2]).unwrap(), &[2u8, 2][..]);
         assert!(e.get(&[3]).is_none());
+    }
+
+    #[test]
+    fn test_engine_set_at_skips_replayed_index() {
+        let e = LocalEngine::new();
+        assert_eq!(e.set_at(4, b"k", b"first"), ApplyOutcome::Applied);
+        assert_eq!(e.set_at(4, b"k", b"again"), ApplyOutcome::Skipped);
+        assert_eq!(e.set_at(2, b"k", b"older"), ApplyOutcome::Skipped);
+        assert_eq!(e.get(b"k").unwrap(), &b"first"[..]);
+        assert_eq!(e.set_at(5, b"k", b"newer"), ApplyOutcome::Applied);
+        assert_eq!(e.get(b"k").unwrap(), &b"newer"[..]);
+    }
+
+    #[test]
+    fn test_engine_apply_at_replay_is_idempotent() {
+        enum Op {
+            Set(&'static [u8], &'static [u8]),
+            Del(&'static [u8]),
+            Cas(&'static [u8], Option<&'static [u8]>, Option<&'static [u8]>),
+        }
+        let ops = [
+            Op::Set(b"a", b"1"),
+            Op::Set(b"b", b"2"),
+            Op::Cas(b"a", Some(b"1"), Some(b"11")),
+            Op::Del(b"b"),
+            Op::Cas(b"c", None, Some(b"3")),
+            Op::Cas(b"a", Some(b"zzz"), Some(b"bad")), // mismatch
+            Op::Set(b"b", b"22"),
+            Op::Cas(b"c", Some(b"3"), None),
+            Op::Del(b"ghost"),
+        ];
+        let run = |e: &LocalEngine| -> Vec<ApplyOutcome> {
+            ops.iter()
+                .enumerate()
+                .map(|(i, op)| {
+                    let n = i as u64 + 1;
+                    match op {
+                        Op::Set(k, v) => e.set_at(n, k, v),
+                        Op::Del(k) => e.delete_at(n, k),
+                        Op::Cas(k, exp, des) => e.cas_at(n, k, *exp, *des),
+                    }
+                })
+                .collect()
+        };
+        let e = LocalEngine::new();
+        let first = run(&e);
+        assert_eq!(first[5], ApplyOutcome::CasFailed { current: Some(Bytes::from_static(b"11")) });
+        let keys: [&[u8]; 4] = [b"a", b"b", b"c", b"ghost"];
+        let before: Vec<_> = keys.iter().map(|k| e.get(k)).collect();
+        assert_eq!(before[0].as_deref(), Some(&b"11"[..]));
+        assert_eq!(before[1].as_deref(), Some(&b"22"[..]));
+        assert_eq!(before[2], None);
+
+        // Replaying the identical sequence at the same indices: every write
+        // that landed the first time is Skipped, and state is unchanged.
+        let second = run(&e);
+        for (i, out) in second.iter().enumerate() {
+            match (i, out) {
+                // The failed CAS never stamped, so its replay is evaluated
+                // again and fails identically against the unchanged value.
+                (5, ApplyOutcome::CasFailed { current }) => {
+                    assert_eq!(current.as_deref(), Some(&b"11"[..]));
+                }
+                // A delete on a never-slotted key creates no slot, so there is
+                // no stamp to skip on; it reports Applied and changes nothing.
+                (8, ApplyOutcome::Applied) => {}
+                (_, ApplyOutcome::Skipped) => {}
+                other => panic!("op {i}: unexpected replay outcome {other:?}"),
+            }
+        }
+        assert_eq!(e.index().stamp_of(b"ghost"), None);
+        let after: Vec<_> = keys.iter().map(|k| e.get(k)).collect();
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn test_engine_cas_at_failure_returns_current() {
+        let e = LocalEngine::new();
+        e.set_at(1, b"k", b"v");
+        assert_eq!(
+            e.cas_at(2, b"k", Some(b"x"), Some(b"y")),
+            ApplyOutcome::CasFailed { current: Some(Bytes::from_static(b"v")) }
+        );
+        assert_eq!(
+            e.cas_at(3, b"missing", Some(b"x"), Some(b"y")),
+            ApplyOutcome::CasFailed { current: None }
+        );
+        assert_eq!(e.index().stamp_of(b"k"), Some(1));
+        assert_eq!(e.cas_at(4, b"k", Some(b"v"), Some(b"y")), ApplyOutcome::Applied);
+        assert_eq!(e.get(b"k").unwrap(), &b"y"[..]);
+    }
+
+    #[test]
+    fn test_engine_scan_then_load_record_roundtrip() {
+        let src = LocalEngine::new();
+        for i in 0..20u8 {
+            src.set_at(i as u64 + 1, &[i], &[i; 40]);
+        }
+        src.delete_at(30, &[4]); // newer than threshold: retained tombstone
+        src.delete_at(2, &[0]); // stale tombstone: dropped
+        let dst = LocalEngine::new();
+        let mut n = 0;
+        src.scan_versioned(10, |e| {
+            dst.load_record(&e.key, e.value.as_deref(), e.stamp);
+            n += 1;
+        });
+        // Key 0's tombstone (stamp 2 <= 10) is dropped; key 4's (stamp 30) is
+        // retained, so 19 records: 18 live plus one tombstone.
+        assert_eq!(n, 19);
+        for i in 0..20u8 {
+            if i == 0 {
+                continue; // dropped tombstone: absent in dst, absent in src
+            }
+            assert_eq!(dst.get(&[i]), src.get(&[i]), "key {i}");
+            assert_eq!(dst.index().stamp_of(&[i]), src.index().stamp_of(&[i]), "stamp {i}");
+        }
+        assert_eq!(dst.get(&[0]), None);
+        assert_eq!(dst.index().stamp_of(&[4]), Some(30));
+        assert_eq!(dst.set_at(5, &[4], b"stale"), ApplyOutcome::Skipped);
     }
 
     #[test]
