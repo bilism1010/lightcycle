@@ -15,6 +15,13 @@
 //!
 //! Set `LC_WAL_BENCH_OPS` to override the op count of all three scenarios for a short local run.
 //!
+//! The report is expensive (the real-fsync scenarios take tens of seconds where an fsync is
+//! about 4 ms), so it runs only for a plain `cargo bench --bench wal`. It is skipped under
+//! `cargo test --benches` / `--all-targets` (test mode), with `--list`, and when a Criterion
+//! filter is given (`cargo bench --bench wal -- fakeio`). `LC_WAL_BENCH_TAIL=1` forces it and
+//! `LC_WAL_BENCH_TAIL=0` suppresses it. A flag value such as `--save-baseline name` looks like a
+//! filter to this check and also skips the report; set `LC_WAL_BENCH_TAIL=1` in that case.
+//!
 //! The StdFsIo scenarios create their WAL directory under `LC_WAL_BENCH_DIR` when set, otherwise
 //! under the system temp directory. On many Linux hosts `/tmp` is tmpfs, where `fsync` is nearly
 //! free, so for a meaningful `[tail]`/`[fsync]` figure point `LC_WAL_BENCH_DIR` at the device
@@ -157,8 +164,23 @@ fn append_ack_report() {
     std_scenario("stdfs always, 1 in flight", ops_override(300), 1);
 }
 
+/// Whether to print the tail report before the Criterion groups (see the header).
+fn report_wanted() -> bool {
+    match std::env::var("LC_WAL_BENCH_TAIL").as_deref() {
+        Ok("1") => return true,
+        Ok("0") => return false,
+        _ => {}
+    }
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let has = |flag: &str| args.iter().any(|a| a == flag);
+    let filtered = args.iter().any(|a| !a.starts_with('-'));
+    has("--bench") && !has("--test") && !has("--list") && !filtered
+}
+
 fn bench_wal(c: &mut Criterion) {
-    append_ack_report();
+    if report_wanted() {
+        append_ack_report();
+    }
 
     let mut g = c.benchmark_group("wal/append_ack");
     let mut h = spawn(Box::new(FakeIo::new()), 4 * 1024 * 1024);
