@@ -298,3 +298,63 @@ async fn partition_heals_and_minority_converges() {
         "the uncommitted write must be absent"
     );
 }
+
+/// Crash a node with a genuinely torn WAL tail (decision D-16): its fsync is delayed while writes
+/// keep arriving, so a record is half-persisted when power is lost. Restart must discard the torn
+/// bytes by CRC rather than fail, and no acknowledged write may be lost on any node.
+#[tokio::test(flavor = "multi_thread")]
+async fn kill_restart_keeps_committed_writes() {
+    let opts = ClusterOpts { use_fake_io: true, ..ClusterOpts::default() };
+    let mut cluster = TestCluster::start(3, opts).await;
+    cluster.leader().await;
+
+    write_keys(&cluster, "base", 0..100).await;
+    let mut acked = expect_map("base", 0..100);
+    cluster.wait_converged(&[1, 2, 3], &acked).await;
+
+    // Crash 1: a follower, torn after 7 unsynced bytes.
+    let leader = cluster.leader().await;
+    let follower = (1..=3).find(|id| *id != leader).unwrap();
+    let writer = cluster.spawn_writer("bg1");
+    writer.wait_acked(5).await;
+    cluster.crash_with_unsynced_tail(follower, 7).await;
+    let progress = writer.acked();
+    writer.wait_acked(progress + 5).await; // two of three nodes keep committing
+    acked.extend(writer.stop().await);
+
+    cluster.restart(follower).await;
+    let first = cluster.node(follower).recovery_stats();
+    assert!(
+        first.torn_bytes_discarded > 0,
+        "follower restart must have discarded a torn tail, not found a clean log: {first:?}"
+    );
+    cluster.assert_contain_and_identical(&[1, 2, 3], &acked).await;
+
+    // Crash 2: the leader, torn after 301 unsynced bytes, while writes continue through the
+    // survivor that wins the next election.
+    let leader = cluster.leader().await;
+    let writer = cluster.spawn_writer("bg2");
+    writer.wait_acked(5).await;
+    cluster.crash_with_unsynced_tail(leader, 301).await;
+    let survivors: Vec<u64> = (1..=3).filter(|id| *id != leader).collect();
+    let new_leader = cluster.leader_among(&survivors).await;
+    assert_ne!(new_leader, leader);
+    let progress = writer.acked();
+    writer.wait_acked(progress + 5).await;
+    acked.extend(writer.stop().await);
+
+    cluster.restart(leader).await;
+    let second = cluster.node(leader).recovery_stats();
+    let torn_total = first.torn_bytes_discarded + second.torn_bytes_discarded;
+    assert!(
+        torn_total > 0,
+        "torn tails must have been discarded: first {first:?}, second {second:?}"
+    );
+
+    // Every acknowledged write is on all three nodes, and the nodes are identical (a write that
+    // was in flight at a crash and never acknowledged may be present or absent, but the same
+    // everywhere).
+    cluster.leader().await;
+    cluster.assert_contain_and_identical(&[1, 2, 3], &acked).await;
+    eprintln!("torn bytes discarded: follower {first:?}, ex-leader {second:?}");
+}
