@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use futures::future::BoxFuture;
-use futures::stream::BoxStream;
+use futures::stream::{BoxStream, SplitSink, SplitStream};
 use futures::{SinkExt, Stream, StreamExt};
 use openraft::errors::{NetworkError, RPCError, ReplicationClosed, StreamingError, Unreachable};
 use openraft::network::{RPCOption, RPCTypes};
@@ -29,14 +29,15 @@ use openraft::raft::{
 use openraft::type_config::alias::{SnapshotOf, VoteOf};
 use openraft::{BasicNode, OptionalSend, RaftNetworkFactory, RaftNetworkV2};
 use tokio::net::TcpStream;
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use tokio_util::codec::Framed;
 
 use crate::net::protocol::{
-    decode_body, encode_body, ProtocolError, RemoteFailure, APPEND_REQ, APPEND_RESP, PREVOTE_REQ,
-    PREVOTE_RESP, VOTE_REQ, VOTE_RESP,
+    decode_body, encode_body, AbortOnDrop, ProtocolError, RemoteFailure, WireAppendResult,
+    APPEND_REQ, APPEND_RESP, PREVOTE_REQ, PREVOTE_RESP, VOTE_REQ, VOTE_RESP,
 };
 use crate::raft::types::{SnapshotFile, TypeConfig};
-use crate::wire::frame::{Frame, FrameCodec, FrameError, Lane, KIND_ERROR};
+use crate::wire::frame::{Frame, FrameCodec, FrameError, Lane, HEADER_LEN, KIND_ERROR};
 use crate::wire::hello::{client_handshake, HandshakeError, Hello};
 
 /// Frame cap in force until the server's HelloAck has arrived.
@@ -316,16 +317,31 @@ impl RaftNetworkV2<TypeConfig> for PeerClient {
     async fn append_entries(
         &mut self,
         rpc: AppendEntriesRequest<TypeConfig>,
-        _option: RPCOption,
+        option: RPCOption,
     ) -> Result<AppendResult<TypeConfig>, RPCError<TypeConfig>> {
-        let _ = (rpc, APPEND_REQ, APPEND_RESP);
-        Err(unreachable_err("append_entries not implemented yet"))
+        let body = encode_body(&rpc).map_err(network_err::<ProtocolError>)?;
+        let frame = self
+            .unary(APPEND_REQ, APPEND_RESP, body, RPCTypes::AppendEntries, &option)
+            .await?;
+        let wire: WireAppendResult = decode_body(&frame.body).map_err(|e| {
+            self.conn = None;
+            network_err(e)
+        })?;
+        Ok(wire.into())
     }
 
+    /// Pipelined AppendEntries over this client's own connection (decision D-07).
+    ///
+    /// The connection is taken for the session: a writer task sends requests without waiting for
+    /// answers, bounded by a request window and a byte window; the returned stream reads the
+    /// responses, which arrive in request order on the single TCP connection, and checks each
+    /// `req_id` against the oldest unanswered request. Any mismatch, wrong kind, decode failure,
+    /// timeout or EOF yields one error item and ends the stream; the connection is dropped and
+    /// the next call dials afresh.
     fn stream_append<'s, S>(
         &'s mut self,
-        _input: S,
-        _option: RPCOption,
+        input: S,
+        option: RPCOption,
     ) -> BoxFuture<
         's,
         Result<
@@ -336,7 +352,44 @@ impl RaftNetworkV2<TypeConfig> for PeerClient {
     where
         S: Stream<Item = AppendEntriesRequest<TypeConfig>> + OptionalSend + Unpin + 'static,
     {
-        Box::pin(async { Err(unreachable_err("stream_append not implemented yet")) })
+        Box::pin(async move {
+            self.ensure_conn(RPCTypes::AppendEntries).await?;
+            let framed = self
+                .conn
+                .take()
+                .expect("ensure_conn established a connection");
+            let (sink, stream) = framed.split();
+            let byte_total = (self.cfg.inflight_bytes / 1024).max(1);
+            let (pending_tx, pending_rx) = mpsc::unbounded_channel();
+            let writer = tokio::spawn(append_writer(
+                input,
+                sink,
+                pending_tx,
+                Arc::new(Semaphore::new(self.cfg.inflight_requests.max(1))),
+                Arc::new(Semaphore::new(byte_total)),
+                byte_total,
+                self.lane,
+                self.cfg.lane_frame_cap(self.lane),
+            ));
+            let reader = ResponseReader {
+                stream,
+                pending: pending_rx,
+                soft_ttl: option.soft_ttl(),
+                me: self.cfg.node_id,
+                target: self.target,
+                _writer: AbortOnDrop(writer),
+            };
+            let out = futures::stream::unfold(Some(reader), |reader| async move {
+                let mut reader = reader?;
+                match reader.next_response().await {
+                    Step::Response(result) => Some((Ok(result), Some(reader))),
+                    Step::End => None,
+                    Step::Failed(e) => Some((Err(e), None)),
+                }
+            })
+            .boxed();
+            Ok(out)
+        })
     }
 
     async fn vote(
@@ -366,5 +419,137 @@ impl RaftNetworkV2<TypeConfig> for PeerClient {
         Err(StreamingError::Unreachable(Unreachable::from_string(
             "snapshot transfer not implemented yet",
         )))
+    }
+}
+
+/// A request handed to the wire (or a writer failure) as seen by the response reader.
+enum Pending {
+    /// Request `req_id` was sent; its window permits are released when its response arrives.
+    Sent {
+        req_id: u64,
+        permits: (OwnedSemaphorePermit, OwnedSemaphorePermit),
+    },
+    /// The writer could not produce a request (for example it exceeds the frame cap).
+    Failed(RPCError<TypeConfig>),
+}
+
+/// Send requests from `input` without waiting for answers, within the request and byte windows.
+///
+/// A request's id is queued for the reader before its frame is written, so a response can never
+/// outrun its id. The task ends when `input` ends, a write fails (the reader then sees the dead
+/// socket) or the owning stream is dropped (the task is aborted).
+#[allow(clippy::too_many_arguments)]
+async fn append_writer<S>(
+    mut input: S,
+    mut sink: SplitSink<Framed<TcpStream, FrameCodec>, Frame>,
+    pending: mpsc::UnboundedSender<Pending>,
+    req_sem: Arc<Semaphore>,
+    byte_sem: Arc<Semaphore>,
+    byte_total: usize,
+    lane: Lane,
+    frame_cap: usize,
+) where
+    S: Stream<Item = AppendEntriesRequest<TypeConfig>> + Unpin,
+{
+    let mut next_id = 1u64;
+    while let Some(req) = input.next().await {
+        let body = match encode_body(&req) {
+            Ok(body) => body,
+            Err(e) => {
+                let _ = pending.send(Pending::Failed(network_err(e)));
+                return;
+            }
+        };
+        if HEADER_LEN + body.len() > frame_cap {
+            let too_large = FrameError::TooLarge {
+                declared: HEADER_LEN + body.len(),
+                max: frame_cap,
+            };
+            let _ = pending.send(Pending::Failed(network_err(too_large)));
+            return;
+        }
+        // A body larger than the whole byte window is admitted alone.
+        let kib = body.len().div_ceil(1024).clamp(1, byte_total);
+        let Ok(req_permit) = req_sem.clone().acquire_owned().await else {
+            return;
+        };
+        let Ok(byte_permit) = byte_sem.clone().acquire_many_owned(kib as u32).await else {
+            return;
+        };
+        let req_id = next_id;
+        next_id += 1;
+        let sent = Pending::Sent {
+            req_id,
+            permits: (req_permit, byte_permit),
+        };
+        if pending.send(sent).is_err() {
+            return;
+        }
+        if sink
+            .send(Frame::new(APPEND_REQ, lane, req_id, body))
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
+}
+
+enum Step {
+    Response(AppendResult<TypeConfig>),
+    End,
+    Failed(RPCError<TypeConfig>),
+}
+
+/// Read half of a pipelined session.
+struct ResponseReader {
+    stream: SplitStream<Framed<TcpStream, FrameCodec>>,
+    pending: mpsc::UnboundedReceiver<Pending>,
+    soft_ttl: Duration,
+    me: u64,
+    target: u64,
+    /// Aborts the writer when the response stream is dropped.
+    _writer: AbortOnDrop,
+}
+
+impl ResponseReader {
+    /// The next in-order response, or the end of the session.
+    async fn next_response(&mut self) -> Step {
+        // Waiting for the writer to queue the next request is not timed: an idle session is
+        // healthy. The stream ends when the writer is done and everything sent was answered.
+        let (req_id, _permits) = match self.pending.recv().await {
+            None => return Step::End,
+            Some(Pending::Failed(e)) => return Step::Failed(e),
+            Some(Pending::Sent { req_id, permits }) => (req_id, permits),
+        };
+        let frame = match tokio::time::timeout(self.soft_ttl, self.stream.next()).await {
+            Err(_) => {
+                return Step::Failed(RPCError::Timeout(openraft::errors::Timeout {
+                    action: RPCTypes::AppendEntries,
+                    id: self.me,
+                    target: self.target,
+                    timeout: self.soft_ttl,
+                }))
+            }
+            Ok(None) => return Step::Failed(unreachable_err("connection closed by peer")),
+            Ok(Some(Err(e))) => return Step::Failed(frame_err(e)),
+            Ok(Some(Ok(frame))) => frame,
+        };
+        if frame.header.req_id != req_id {
+            return Step::Failed(network_err(std::io::Error::other(format!(
+                "response req_id {} does not match oldest unanswered request {}",
+                frame.header.req_id, req_id
+            ))));
+        }
+        match frame.header.kind {
+            APPEND_RESP => match decode_body::<WireAppendResult>(&frame.body) {
+                Ok(wire) => Step::Response(wire.into()),
+                Err(e) => Step::Failed(network_err(e)),
+            },
+            KIND_ERROR => Step::Failed(remote_failure_err(&RemoteFailure::decode(&frame.body))),
+            other => Step::Failed(network_err(std::io::Error::other(format!(
+                "unexpected frame kind {other} in append response"
+            )))),
+        }
     }
 }
