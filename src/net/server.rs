@@ -347,7 +347,7 @@ async fn run_lane(
     // the guard below does on every exit path.
     let conn_cancel = cancel.child_token();
     let _conn_guard = conn_cancel.clone().drop_guard();
-    let _writer = AbortOnDrop(tokio::spawn(writer_task(sink, out_rx, conn_cancel.clone())));
+    let mut writer = AbortOnDrop(tokio::spawn(writer_task(sink, out_rx, conn_cancel.clone())));
     let unary_slots = Arc::new(Semaphore::new(cfg.inflight_requests.max(1)));
     let mut append: Option<AppendSession> = None;
 
@@ -482,6 +482,17 @@ async fn run_lane(
                 break;
             }
         }
+    }
+
+    // The connection is ending. The last frames queued for the peer (a Fatal reason, a Conflict
+    // answer) must reach the socket before the writer is stopped, so stop every producer and let
+    // the writer drain; aborting it outright makes delivery a scheduling race. A server shutdown
+    // (the parent token) skips the courtesy. The wait is bounded for a peer that stopped reading.
+    conn_cancel.cancel();
+    drop(append);
+    drop(out_tx);
+    if !cancel.is_cancelled() {
+        let _ = tokio::time::timeout(ERROR_SEND_TIMEOUT, &mut writer.0).await;
     }
 }
 

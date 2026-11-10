@@ -948,6 +948,63 @@ async fn handler_fatal_on_stream_maps_to_unreachable() {
     server.shutdown().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn final_fatal_frame_is_delivered_before_the_connection_closes() {
+    // The responder's last frame (the Fatal reason) must be flushed before the connection is torn
+    // down; losing it leaves the peer with a bare EOF and no reason.
+    struct FatalStream;
+    impl RaftHandler for FatalStream {
+        fn append_entries(
+            &self,
+            _req: AppendEntriesRequest<TypeConfig>,
+        ) -> BoxFuture<'static, Result<AppendResult<TypeConfig>, RaftError<TypeConfig>>> {
+            Box::pin(async { Err(RaftError::Fatal(Fatal::Stopped)) })
+        }
+        fn stream_append(
+            &self,
+            reqs: BoxStream<'static, AppendEntriesRequest<TypeConfig>>,
+        ) -> BoxStream<'static, Result<AppendResult<TypeConfig>, Fatal<TypeConfig>>> {
+            reqs.map(|_| Err(Fatal::Stopped)).boxed()
+        }
+        fn vote(
+            &self,
+            _req: VoteRequest<TypeConfig>,
+        ) -> BoxFuture<'static, Result<VoteResponse<TypeConfig>, RaftError<TypeConfig>>> {
+            Box::pin(async { Err(RaftError::Fatal(Fatal::Stopped)) })
+        }
+        fn pre_vote(
+            &self,
+            _req: VoteRequest<TypeConfig>,
+        ) -> BoxFuture<'static, Result<VoteResponse<TypeConfig>, RaftError<TypeConfig>>> {
+            Box::pin(async { Err(RaftError::Fatal(Fatal::Stopped)) })
+        }
+        fn install_snapshot(
+            &self,
+            _vote: VoteOf<TypeConfig>,
+            _meta: SnapshotMetaOf<TypeConfig>,
+            _file: SnapshotFile,
+        ) -> BoxFuture<'static, Result<SnapshotResponse<TypeConfig>, Fatal<TypeConfig>>> {
+            Box::pin(async { Err(Fatal::Stopped) })
+        }
+    }
+
+    let server = start_server(Arc::new(FatalStream), |_| {}).await;
+    for round in 0..40 {
+        let mut peer = client(&server, config(CLUSTER, CLIENT_NODE), Lane::Replication).await;
+        let mut out = peer
+            .stream_append(futures::stream::iter(vec![append_req(1)]), opt())
+            .await
+            .expect("stream established");
+        let first = out.next().await.expect("an error item");
+        let text = format!("{first:?}");
+        assert!(
+            matches!(first, Err(RPCError::Unreachable(_))) && text.contains("remote node stopped"),
+            "round {round}: the Fatal reason was lost: {text}"
+        );
+    }
+    server.shutdown().await;
+}
+
 // ---- snapshot lane (plan 03-17) -------------------------------------------------------------
 
 use std::path::Path;
