@@ -40,6 +40,9 @@ enum Ext {
     Tmp,
 }
 
+/// Re-lists attempted by [`SnapshotStore::latest`] when the newest file vanishes under it.
+const LATEST_RETRIES: usize = 3;
+
 const DIGITS: usize = 20;
 /// `snap-` + 20 digits + `-` + 20 digits.
 const STEM_LEN: usize = 5 + DIGITS + 1 + DIGITS;
@@ -153,10 +156,16 @@ impl SnapshotStore {
         Ok(v)
     }
 
+    /// Removes the published snapshots whose key satisfies `pred`. A file that is already gone
+    /// (a concurrent build or install removed it between the listing and the unlink) is the
+    /// desired end state, not an error.
     fn delete_snaps_where(&self, pred: impl Fn((u64, u64)) -> bool) -> io::Result<()> {
         for (i, t, p) in self.snaps()? {
             if pred((i, t)) {
-                fs::remove_file(p)?;
+                match fs::remove_file(p) {
+                    Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+                    _ => {}
+                }
             }
         }
         Ok(())
@@ -166,6 +175,18 @@ impl SnapshotStore {
     /// otherwise [`SnapshotError::CorruptNeedsWipe`] (no fallback to an older file). Block-level
     /// integrity is checked when the snapshot is loaded or installed.
     pub fn latest(&self) -> Result<Option<(Meta, SnapshotFile)>, SnapshotError> {
+        // A concurrent build or install can delete the file between listing and reading it. That
+        // is a lost race, not a failure: list again, which then finds the newer file.
+        for _ in 0..LATEST_RETRIES {
+            match self.latest_once() {
+                Err(SnapshotError::Io(e)) if e.kind() == io::ErrorKind::NotFound => continue,
+                other => return other,
+            }
+        }
+        self.latest_once()
+    }
+
+    fn latest_once(&self) -> Result<Option<(Meta, SnapshotFile)>, SnapshotError> {
         let Some((index, term, path)) = self.snaps()?.pop() else {
             return Ok(None);
         };

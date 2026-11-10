@@ -309,6 +309,9 @@ impl RaftStateMachine<TypeConfig> for KvStateMachine {
         let store = self.snapshots.clone().ok_or_else(|| {
             io::Error::new(io::ErrorKind::Unsupported, "snapshots are not configured")
         })?;
+        // Serialize against snapshot builds: a build that started on the pre-install engine must
+        // not publish (and delete older files) around the install. Held until the engine swap.
+        let _build_guard = Arc::clone(&self.build_lock).lock_owned().await;
         let expected = meta.clone();
         let path = snapshot.path;
         let engine = tokio::task::spawn_blocking(move || {
@@ -469,6 +472,27 @@ mod tests {
         // A reader holding the old Arc still sees the old data.
         assert_eq!(old_engine.get(b"k1"), Some(b("v1")));
         assert_eq!(old_engine.get(b"key1"), None);
+    }
+
+    #[tokio::test]
+    async fn install_waits_for_an_in_flight_build() {
+        let (dir_a, dir_b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (_a, snap) = machine_with_snapshot(dir_a.path(), 1..=10).await;
+        let mut b_sm = KvStateMachine::open(dir_b.path()).await.unwrap();
+        let received = stage_received(&b_sm, &snap);
+
+        let build = b_sm.try_create_snapshot_builder(false).await.expect("lock is free");
+        {
+            let install = b_sm.install_snapshot(&snap.meta, received);
+            tokio::pin!(install);
+            let wait = std::time::Duration::from_millis(100);
+            let waited = tokio::time::timeout(wait, &mut install).await;
+            assert!(waited.is_err(), "install must wait while a build holds the lock");
+
+            drop(build);
+            install.await.unwrap();
+        }
+        assert_eq!(b_sm.engine().get(b"key10"), Some(b("val10")));
     }
 
     #[tokio::test]
