@@ -363,11 +363,23 @@ async fn kill_restart_keeps_committed_writes() {
 // Dynamic membership (plan 03-16).
 // ---------------------------------------------------------------------------------------------
 
-use common::MembershipLog;
+use common::{dump, MembershipLog};
 use std::collections::BTreeSet;
 
 fn set_of(ids: &[u64]) -> BTreeSet<u64> {
     ids.iter().copied().collect()
+}
+
+/// Start node `id` outside the membership, add it as a learner (blocking until caught up), then
+/// promote it to a voter alongside `current`. Returns the new voter list.
+async fn grow(cluster: &mut TestCluster, current: &[u64], id: u64, log: &MembershipLog) -> Vec<u64> {
+    cluster.start_extra(id).await;
+    log.watch(cluster.node(id));
+    cluster.add_learner(current, id).await.expect("add learner");
+    let mut next = current.to_vec();
+    next.push(id);
+    cluster.change_membership(current, &set_of(&next), false).await.expect("promote learner");
+    next
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -402,4 +414,128 @@ async fn membership_add_voter() {
     // Adding one voter to {1,2,3}: old and new quorums intersect, so openraft takes the
     // single-step path and no joint configuration is ever written.
     assert!(!log.saw_joint(), "unexpected joint configuration: {:?}", log.configs());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn membership_remove_voter() {
+    let mut cluster = TestCluster::start(3, ClusterOpts::default()).await;
+    let log = MembershipLog::new();
+    for id in 1..=3 {
+        log.watch(cluster.node(id));
+    }
+    cluster.leader().await;
+    write_keys(&cluster, "a", 0..20).await;
+    let voters = grow(&mut cluster, &[1, 2, 3], 4, &log).await;
+    cluster.wait_voters(&voters, &set_of(&voters)).await;
+    let mut expected = expect_map("a", 0..20);
+    cluster.wait_converged(&voters, &expected).await;
+
+    // Remove a follower (never the leader here).
+    let leader = cluster.leader().await;
+    let removed = *voters.iter().find(|id| **id != leader).unwrap();
+    let remaining: Vec<u64> = voters.iter().copied().filter(|id| *id != removed).collect();
+    cluster.remove_voters(&voters, &set_of(&[removed])).await.expect("remove voter");
+    cluster.wait_voters(&remaining, &set_of(&remaining)).await;
+    for id in &remaining {
+        let m = cluster.node(*id).metrics();
+        assert!(
+            !m.membership_config.nodes().any(|(n, _)| *n == removed),
+            "node {id} still lists removed node {removed}: {}",
+            m.membership_config
+        );
+    }
+
+    // The remaining three keep committing; the removed node stops receiving writes.
+    write_keys_among(&cluster, &remaining, "b", 0..20).await;
+    let before_removal = expected.clone();
+    expected.extend(expect_map("b", 0..20));
+    cluster.wait_converged(&remaining, &expected).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        dump(&cluster.node(removed).engine()),
+        before_removal,
+        "the removed node must not see writes made after its removal"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn membership_replace_voters_joint() {
+    let mut cluster = TestCluster::start(3, ClusterOpts::default()).await;
+    let log = MembershipLog::new();
+    for id in 1..=3 {
+        log.watch(cluster.node(id));
+    }
+    cluster.leader().await;
+    write_keys(&cluster, "a", 0..20).await;
+    let mut acked = expect_map("a", 0..20);
+    cluster.wait_converged(&[1, 2, 3], &acked).await;
+
+    // Both new nodes join as learners first, so catch-up is not what the change waits for.
+    for id in [4, 5] {
+        cluster.start_extra(id).await;
+        log.watch(cluster.node(id));
+        cluster.add_learner(&[1, 2, 3], id).await.expect("add learner");
+    }
+
+    // {1,2,3} -> {3,4,5}: the old quorum {1,2} and the new quorum {4,5} do not intersect.
+    let writer = cluster.spawn_writer("bg");
+    writer.wait_acked(5).await;
+    cluster.change_membership(&[1, 2, 3], &set_of(&[3, 4, 5]), false).await.expect("replace");
+    let final_voters = [3u64, 4, 5];
+    cluster.wait_voters(&final_voters, &set_of(&final_voters)).await;
+    let progress = writer.acked();
+    writer.wait_acked(progress + 5).await; // writable through the new voters
+    acked.extend(writer.stop().await);
+
+    let joint = log.configs().into_iter().find(|(_, c)| c.len() > 1);
+    assert!(
+        joint.is_some(),
+        "no joint configuration observed replacing {{1,2,3}} with {{3,4,5}}; recorded: {:?}",
+        log.configs()
+    );
+    let (_, joint_cfg) = joint.unwrap();
+    assert!(
+        joint_cfg.contains(&set_of(&[1, 2, 3])) && joint_cfg.contains(&set_of(&[3, 4, 5])),
+        "joint configuration names the wrong voter sets: {joint_cfg:?}"
+    );
+
+    write_keys_among(&cluster, &final_voters, "c", 0..20).await;
+    acked.extend(expect_map("c", 0..20));
+    cluster.assert_contain_and_identical(&final_voters, &acked).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn membership_remove_leader_new_leader_elected() {
+    let mut cluster = TestCluster::start(3, ClusterOpts::default()).await;
+    let log = MembershipLog::new();
+    for id in 1..=3 {
+        log.watch(cluster.node(id));
+    }
+    cluster.leader().await;
+    write_keys(&cluster, "a", 0..20).await;
+    let voters = grow(&mut cluster, &[1, 2, 3], 4, &log).await;
+    cluster.wait_voters(&voters, &set_of(&voters)).await;
+    let mut acked = expect_map("a", 0..20);
+    cluster.wait_converged(&voters, &acked).await;
+
+    let old_leader = cluster.leader().await;
+    let remaining: Vec<u64> = voters.iter().copied().filter(|id| *id != old_leader).collect();
+    let writer = cluster.spawn_writer("bg");
+    writer.wait_acked(5).await;
+    cluster.remove_voters(&voters, &set_of(&[old_leader])).await.expect("remove leader");
+
+    // A new leader among the remaining voters is elected and accepts writes.
+    let new_leader = tokio::time::timeout(Duration::from_secs(15), cluster.leader_among(&remaining))
+        .await
+        .expect("a new leader within 15 s of removing the old one");
+    assert_ne!(new_leader, old_leader);
+    assert!(remaining.contains(&new_leader));
+    let progress = writer.acked();
+    writer.wait_acked(progress + 5).await;
+    acked.extend(writer.stop().await);
+    write_keys_among(&cluster, &remaining, "c", 0..20).await;
+    acked.extend(expect_map("c", 0..20));
+
+    cluster.wait_voters(&remaining, &set_of(&remaining)).await;
+    cluster.assert_contain_and_identical(&remaining, &acked).await;
 }
