@@ -28,6 +28,21 @@ pub enum KvRequest {
     },
 }
 
+impl KvRequest {
+    /// Bytes of user data (keys and values) the command carries.
+    pub fn payload_len(&self) -> usize {
+        match self {
+            KvRequest::Set { key, value } => key.len() + value.len(),
+            KvRequest::Delete { key } => key.len(),
+            KvRequest::Cas { key, expected, desired } => {
+                key.len()
+                    + expected.as_ref().map_or(0, |b| b.len())
+                    + desired.as_ref().map_or(0, |b| b.len())
+            }
+        }
+    }
+}
+
 impl std::fmt::Display for KvRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{:?}", self)

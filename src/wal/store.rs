@@ -30,6 +30,7 @@ use parking_lot::RwLock;
 use super::cache::{read_entry, LogIndex, LogShared, SharedObserver};
 use super::io::{SegmentIo, SegmentRead, StdFsIo};
 use super::recovery::{recover, RecoveryStats};
+use super::record::{MAX_RECORD_LEN, RECORD_HEADER_LEN};
 use super::segment::{WalConfig, WalError};
 use super::writer::{Ack, WalHandle, WalOp, WalPayload, WalStats};
 use crate::raft::types::{KvRequest, TypeConfig};
@@ -41,6 +42,9 @@ type Shared = Arc<RwLock<LogShared<Entry>>>;
 
 /// Fixed per-entry overhead added to the payload size estimate used for cache accounting.
 const ENTRY_OVERHEAD_BYTES: usize = 32;
+/// Space kept free in a segment for its preamble (header plus vote, purge point and committed id)
+/// when deciding whether an entry can ever fit.
+const PREAMBLE_RESERVE_BYTES: usize = 512;
 /// Failed submissions that only yield before the submit loop starts sleeping briefly.
 const YIELD_ATTEMPTS: u32 = 64;
 
@@ -73,6 +77,17 @@ fn estimate_size(entry: &Entry) -> usize {
         _ => 0,
     };
     payload + ENTRY_OVERHEAD_BYTES
+}
+
+/// Largest postcard-encoded entry the writer can frame under `cfg`: it must fit one record
+/// (`MAX_RECORD_LEN` covers the type byte and the 8-byte index prefix) and an otherwise empty
+/// segment. Entries above it are rejected before they touch any state, because the writer cannot
+/// store them.
+pub fn max_entry_bytes(cfg: &WalConfig) -> usize {
+    let by_record = MAX_RECORD_LEN as usize - 1 - 8;
+    let segment = usize::try_from(cfg.segment_size).unwrap_or(usize::MAX);
+    let by_segment = segment.saturating_sub(PREAMBLE_RESERVE_BYTES + RECORD_HEADER_LEN + 8);
+    by_record.min(by_segment)
 }
 
 fn encode<T: serde::Serialize>(value: &T) -> io::Result<Vec<u8>> {
@@ -124,6 +139,8 @@ pub struct WalLogStore {
     last_log_id: Option<LogId>,
     recovery: RecoveryStats,
     stats: Arc<WalStats>,
+    /// Largest encoded entry the writer accepts (see [`max_entry_bytes`]).
+    max_entry: usize,
 }
 
 impl WalLogStore {
@@ -139,6 +156,7 @@ impl WalLogStore {
         cfg: WalConfig,
     ) -> Result<WalLogStore, WalError> {
         let recovered = recover(&mut *io, &cfg)?;
+        let max_entry = max_entry_bytes(&cfg);
         let recovery = recovered.stats();
         let reader = io.reader();
 
@@ -207,6 +225,7 @@ impl WalLogStore {
             last_log_id,
             recovery,
             stats,
+            max_entry,
         })
     }
 
@@ -324,6 +343,27 @@ impl RaftLogStorage<TypeConfig> for WalLogStore {
         if entries.is_empty() {
             callback.io_completed(Ok(()));
             return Ok(());
+        }
+
+        // Reject the whole call before any state changes: an entry the writer cannot store must
+        // never reach the cache, the live bounds or the writer, or the log would gain a hole.
+        let rejected = entries.iter().find_map(|entry| {
+            match postcard::experimental::serialized_size(entry) {
+                Ok(n) if n <= self.max_entry => None,
+                Ok(n) => Some(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "log entry {} encodes to {n} bytes, above the {} byte limit",
+                        entry.log_id.index(),
+                        self.max_entry
+                    ),
+                )),
+                Err(e) => Some(io::Error::other(e)),
+            }
+        });
+        if let Some(err) = rejected {
+            fail_callback(callback, &err);
+            return Err(err);
         }
 
         // Readable the moment this method returns: cache first, then publish.
@@ -525,6 +565,40 @@ mod tests {
 
     fn seg_list(io: &FakeIo) -> Vec<u64> {
         SegmentIo::list_segments(io).unwrap()
+    }
+
+    #[tokio::test]
+    async fn oversized_entry_is_rejected_whole_and_leaves_no_index_gap() {
+        let io = FakeIo::new();
+        let mut store = open(&io, 4096);
+        append_sync(&mut store, entries(1, 2, 1, 16)).await;
+
+        // A non-final oversized entry used to be dropped silently while its successor was acked.
+        let mut batch = entries(3, 4, 1, 16);
+        batch[0] = entry(1, 3, 5000);
+        let (cb, done) = signal();
+        let err = store.append(batch, cb).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(done.await.unwrap_err().kind(), io::ErrorKind::InvalidInput);
+
+        // Nothing of the rejected call is visible, and the log still continues at index 3.
+        assert_eq!(store.get_log_state().await.unwrap().last_log_id, Some(log_id(1, 2)));
+        assert_eq!(read_all(&mut store, 1, 10).await, entries(1, 2, 1, 16));
+        append_sync(&mut store, entries(3, 4, 1, 16)).await;
+        store.shutdown().await;
+
+        let mut store = open(&io, 4096);
+        assert_eq!(read_all(&mut store, 1, 10).await, entries(1, 4, 1, 16));
+        store.shutdown().await;
+    }
+
+    #[test]
+    fn entry_limit_is_bounded_by_record_and_segment() {
+        let big = max_entry_bytes(&cfg(1 << 40));
+        assert_eq!(big, MAX_RECORD_LEN as usize - 9);
+        let small = max_entry_bytes(&cfg(4096));
+        assert!(small < 4096 && small > 4096 - 1024);
+        assert_eq!(max_entry_bytes(&cfg(16)), 0);
     }
 
     #[tokio::test]

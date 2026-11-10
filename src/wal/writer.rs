@@ -462,11 +462,20 @@ impl<P: WalPayload> Writer<P> {
                 ok
             }
         };
-        if !accepted && has_ack {
-            self.acks.fail_last(
-                io::ErrorKind::InvalidInput,
-                "wal record does not fit in a segment",
-            );
+        if !accepted {
+            if has_ack {
+                self.acks.fail_last(
+                    io::ErrorKind::InvalidInput,
+                    "wal record does not fit in a segment",
+                );
+            } else {
+                // Nobody can be told about a dropped record, and the entries after it would leave
+                // a durable index gap that makes the log unrecoverable. Fail-stop instead.
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "wal dropped an unacknowledged record that does not fit",
+                ));
+            }
         }
         Ok(())
     }
@@ -1184,6 +1193,20 @@ mod tests {
         fill(&mut h, 3, 3, 100);
         h.shutdown();
         assert_eq!(seg_entries(&io.segment_bytes(1)), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn unacked_oversize_record_fail_stops_instead_of_leaving_a_gap() {
+        let (mut h, io) = spawn_fake(cfg(4096));
+        fill(&mut h, 1, 2, 100);
+        // Dropped silently before: the following acked entry would then land at a hole.
+        submit(&mut h, WalOp::Entry { index: 3, payload: vec![7; 5000], ack: None });
+        let err = op_wait(&mut h, |ack| WalOp::Entry { index: 4, payload: body(4, 100), ack })
+            .unwrap_err();
+        assert!(!err.to_string().is_empty());
+        assert!(h.is_failed());
+        h.shutdown();
+        assert_eq!(seg_entries(&io.segment_bytes(1)), vec![1, 2]);
     }
 
     #[test]

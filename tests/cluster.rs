@@ -73,6 +73,27 @@ async fn single_node_restart() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn oversized_write_is_rejected_without_stopping_the_node() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = start(bootstrap_cfg(dir.path())).await;
+    assert!(node.bootstrap_if_needed(members()).await.unwrap());
+    assert_eq!(wait_for_leader(&[&node], WAIT).await, 1);
+
+    // Larger than one WAL record: the log store could not store it, and openraft treats a storage
+    // error as fatal, so it must be refused before it is proposed.
+    let huge = KvRequest::Set { key: Bytes::from_static(b"big"), value: Bytes::from(vec![7u8; 17 << 20]) };
+    match node.write(huge).await {
+        Err(lightcycle::raft::node::NodeError::RequestTooLarge { size, max }) => assert!(size > max),
+        other => panic!("expected RequestTooLarge, got {other:?}"),
+    }
+    assert!(node.engine().get(b"big").is_none());
+
+    assert_eq!(node.write(set("after", "ok")).await.unwrap(), KvResponse::Ok);
+    expect_value(&node, "after", "ok").await;
+    node.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn engine_accessor_is_not_captured_at_start() {
     let dir = tempfile::tempdir().unwrap();
     let node = start(bootstrap_cfg(dir.path())).await;

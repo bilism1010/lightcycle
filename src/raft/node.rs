@@ -22,7 +22,7 @@ use super::types::{KvRequest, KvResponse, SnapshotFile, TypeConfig};
 use crate::engine::LocalEngine;
 use crate::wal::io::{SegmentIo, StdFsIo};
 use crate::wal::recovery::RecoveryStats;
-use crate::wal::store::WalLogStore;
+use crate::wal::store::{max_entry_bytes, WalLogStore};
 use crate::wal::writer::WalStats;
 use crate::wal::WalError;
 
@@ -50,6 +50,14 @@ pub enum NodeError {
     /// A Raft operation was rejected.
     #[error("raft error: {0}")]
     Raft(String),
+    /// The command carries more data than one log entry can hold; it was not proposed.
+    #[error("request carries {size} bytes, above the {max} byte limit")]
+    RequestTooLarge {
+        /// Bytes of keys and values in the rejected command.
+        size: usize,
+        /// Largest accepted command payload.
+        max: usize,
+    },
 }
 
 type RaftHandle = Raft<TypeConfig, KvStateMachine>;
@@ -63,7 +71,13 @@ pub struct RaftNode {
     wal_stats: Arc<WalStats>,
     node_id: u64,
     bootstrap: bool,
+    /// Largest command payload one log entry can hold (see [`max_entry_bytes`]).
+    max_request_bytes: usize,
 }
+
+/// Space reserved in a log entry for everything but the command's keys and values (log id,
+/// variant tags, length prefixes).
+const ENTRY_ENVELOPE_RESERVE: usize = 1024;
 
 fn join_io(e: tokio::task::JoinError) -> NodeError {
     NodeError::Io(io::Error::other(e.to_string()))
@@ -109,6 +123,7 @@ impl RaftNode {
         let engine_handle = state_machine.engine_handle();
 
         let wal_cfg = cfg.wal.clone();
+        let max_request_bytes = max_entry_bytes(&wal_cfg).saturating_sub(ENTRY_ENVELOPE_RESERVE);
         let log_store = tokio::task::spawn_blocking(move || WalLogStore::open_with_io(io, wal_cfg))
             .await
             .map_err(join_io)??;
@@ -127,6 +142,7 @@ impl RaftNode {
             wal_stats,
             node_id: cfg.node_id,
             bootstrap: cfg.bootstrap,
+            max_request_bytes,
         })
     }
 
@@ -191,7 +207,18 @@ impl RaftNode {
     }
 
     /// Replicate a client command and wait for it to apply.
+    ///
+    /// A command too large for one WAL record is rejected here with
+    /// [`NodeError::RequestTooLarge`]: proposing it would make the log store fail, and openraft
+    /// treats a storage failure as fatal for the whole node.
     pub async fn write(&self, req: KvRequest) -> Result<KvResponse, NodeError> {
+        let size = req.payload_len();
+        if size > self.max_request_bytes {
+            return Err(NodeError::RequestTooLarge {
+                size,
+                max: self.max_request_bytes,
+            });
+        }
         match self.raft.client_write(req).await {
             Ok(resp) => Ok(resp.data),
             Err(e) => Err(map_write_error(e)),
