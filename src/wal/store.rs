@@ -33,7 +33,7 @@ use super::recovery::{recover, RecoveryStats};
 use super::record::{MAX_RECORD_LEN, RECORD_HEADER_LEN};
 use super::segment::{WalConfig, WalError};
 use super::writer::{Ack, WalHandle, WalOp, WalPayload, WalStats};
-use crate::raft::types::{KvRequest, TypeConfig};
+use crate::raft::types::TypeConfig;
 
 type Entry = EntryOf<TypeConfig>;
 type LogId = LogIdOf<TypeConfig>;
@@ -74,13 +74,7 @@ fn decode_entry(bytes: &[u8]) -> Option<Entry> {
 
 fn estimate_size(entry: &Entry) -> usize {
     let payload = match &entry.payload {
-        EntryPayload::Normal(KvRequest::Set { key, value }) => key.len() + value.len(),
-        EntryPayload::Normal(KvRequest::Delete { key }) => key.len(),
-        EntryPayload::Normal(KvRequest::Cas { key, expected, desired }) => {
-            key.len()
-                + expected.as_ref().map_or(0, |b| b.len())
-                + desired.as_ref().map_or(0, |b| b.len())
-        }
+        EntryPayload::Normal(req) => req.payload_len(),
         _ => 0,
     };
     payload + ENTRY_OVERHEAD_BYTES
@@ -528,6 +522,7 @@ impl RaftLogReader<TypeConfig> for WalLogReader {
 mod tests {
     use super::*;
     use crate::wal::io::{FakeIo, IoEvent, SegmentIo};
+    use crate::raft::types::KvRequest;
     use bytes::Bytes;
     use openraft::type_config::TypeConfigExt;
 
