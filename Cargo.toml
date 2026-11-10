@@ -40,3 +40,7 @@ test-util = []
 [[bench]]
 name = "local_engine"
 harness = false
+
+[[bench]]
+name = "wal"
+harness = false
