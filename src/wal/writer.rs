@@ -447,6 +447,9 @@ impl<P: WalPayload> Writer<P> {
                     self.apply_truncate(keep_through);
                     // Entries before the marker reach the observer first, then the truncation.
                     self.write_run()?;
+                    // Those entries were still in `buf` when `apply_truncate` clamped, and
+                    // `write_run` just raised the watermark to them: clamp again.
+                    self.clamp_unreported(keep_through);
                     self.observer.on_truncate(keep_through);
                 }
                 ok
@@ -627,7 +630,11 @@ impl<P: WalPayload> Writer<P> {
             Some(k) => k.wrapping_add(1),
             None => self.state.purged.as_ref().map_or(0, |(upto, _)| upto.wrapping_add(1)),
         };
-        // Never report durability beyond what the truncation kept.
+        self.clamp_unreported(keep_through);
+    }
+
+    /// Never report durability beyond what the truncation kept.
+    fn clamp_unreported(&mut self, keep_through: Option<u64>) {
         self.unreported = match (self.unreported, keep_through) {
             (Some(u), Some(k)) => Some(u.min(k)),
             _ => None,
@@ -1173,6 +1180,36 @@ mod tests {
                 Ev::Purge(1),
             ]
         );
+    }
+
+    #[test]
+    fn flushed_watermark_never_exceeds_the_log_end_after_an_in_batch_truncate() {
+        // Entries and a truncate marker that land in one batch: the watermark must be clamped
+        // after the entries are written, not before. Batching is timing dependent, so repeat.
+        for round in 0..200 {
+            let log = Arc::new(parking_lot::Mutex::new(Vec::new()));
+            let (mut h, _io) = spawn_fake_with(cfg(1 << 16), Box::new(RecObs(Arc::clone(&log))));
+            for i in 1..=10 {
+                submit(&mut h, entry_op(i, None));
+            }
+            submit(&mut h, WalOp::TruncateAfter { keep_through: Some(5), ack: None });
+            let (ack, rx) = ack_chan();
+            submit(&mut h, entry_op(6, Some(ack)));
+            wait(&rx).unwrap();
+            h.shutdown();
+
+            let mut end = 0u64;
+            for ev in log.lock().iter() {
+                match ev {
+                    Ev::Written(idx) => end = end.max(idx.iter().copied().max().unwrap_or(0)),
+                    Ev::Truncate(k) => end = end.min(k.unwrap_or(0)),
+                    Ev::Flushed(u) => {
+                        assert!(*u <= end, "round {round}: flushed {u} above log end {end}");
+                    }
+                    Ev::Purge(_) => {}
+                }
+            }
+        }
     }
 
     #[test]
