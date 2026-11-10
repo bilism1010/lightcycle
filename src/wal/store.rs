@@ -45,6 +45,13 @@ const ENTRY_OVERHEAD_BYTES: usize = 32;
 /// Space kept free in a segment for its preamble (header plus vote, purge point and committed id)
 /// when deciding whether an entry can ever fit.
 const PREAMBLE_RESERVE_BYTES: usize = 512;
+/// Byte budget for the entries of one replication read (see
+/// [`WalLogReader::limited_get_log_entries`](RaftLogReader::limited_get_log_entries)). A batch
+/// holds the entries up to this budget, or a single entry when that alone is larger (at most
+/// about `MAX_RECORD_LEN`, 16 MiB), so a request stays under half of the transport's default
+/// 32 MiB frame cap. A transport configured with a frame cap below twice this budget can still
+/// refuse a batch of large entries.
+pub const REPLICATION_BATCH_BYTES: usize = 16 * 1024 * 1024;
 /// Failed submissions that only yield before the submit loop starts sleeping briefly.
 const YIELD_ATTEMPTS: u32 = 64;
 
@@ -442,37 +449,68 @@ pub struct WalLogReader {
     meta: Arc<RwLock<Meta>>,
 }
 
-impl RaftLogReader<TypeConfig> for WalLogReader {
-    async fn try_get_log_entries<RB: RangeBounds<u64> + Clone + std::fmt::Debug + OptionalSend>(
-        &mut self,
-        range: RB,
+impl WalLogReader {
+    /// Reads the live entries of `[start, end)`, stopping at a hole. With a `budget`, it also
+    /// stops before an entry that would push the estimated total past it; the first entry is
+    /// always returned, so a non-empty range never yields an empty result.
+    fn read_bounded(
+        &self,
+        start: u64,
+        end: u64,
+        budget: Option<usize>,
     ) -> Result<Vec<Entry>, io::Error> {
         let (first, next) = {
             let meta = self.meta.read();
             (meta.first, meta.next)
         };
-        let lo = match range.start_bound() {
-            Bound::Included(s) => *s,
-            Bound::Excluded(s) => s.saturating_add(1),
-            Bound::Unbounded => 0,
-        }
-        .max(first);
-        let hi = match range.end_bound() {
-            Bound::Included(e) => e.saturating_add(1),
-            Bound::Excluded(e) => *e,
-            Bound::Unbounded => u64::MAX,
-        }
-        .min(next);
+        let lo = start.max(first);
+        let hi = end.min(next);
 
         let mut out = Vec::new();
+        let mut total = 0usize;
         for index in lo..hi {
             match read_entry(&self.shared, &*self.reader, index, decode_entry).map_err(wal_to_io)? {
-                Some(entry) => out.push(entry),
+                Some(entry) => {
+                    if let Some(budget) = budget {
+                        let size = estimate_size(&entry);
+                        if !out.is_empty() && total.saturating_add(size) > budget {
+                            break;
+                        }
+                        total = total.saturating_add(size);
+                    }
+                    out.push(entry);
+                }
                 // Purged or truncated while we read: stop at the hole, never skip it.
                 None => break,
             }
         }
         Ok(out)
+    }
+}
+
+impl RaftLogReader<TypeConfig> for WalLogReader {
+    async fn try_get_log_entries<RB: RangeBounds<u64> + Clone + std::fmt::Debug + OptionalSend>(
+        &mut self,
+        range: RB,
+    ) -> Result<Vec<Entry>, io::Error> {
+        let start = match range.start_bound() {
+            Bound::Included(s) => *s,
+            Bound::Excluded(s) => s.saturating_add(1),
+            Bound::Unbounded => 0,
+        };
+        let end = match range.end_bound() {
+            Bound::Included(e) => e.saturating_add(1),
+            Bound::Excluded(e) => *e,
+            Bound::Unbounded => u64::MAX,
+        };
+        self.read_bounded(start, end, None)
+    }
+
+    /// The replication read: at most [`REPLICATION_BATCH_BYTES`] of entries (always at least
+    /// one), so an AppendEntries request built from it stays under the transport's frame cap
+    /// however large the individual entries are. openraft caps batches by entry count only.
+    async fn limited_get_log_entries(&mut self, start: u64, end: u64) -> Result<Vec<Entry>, io::Error> {
+        self.read_bounded(start, end, Some(REPLICATION_BATCH_BYTES))
     }
 
     async fn read_vote(&mut self) -> Result<Option<Vote>, io::Error> {
@@ -599,6 +637,39 @@ mod tests {
         let small = max_entry_bytes(&cfg(4096));
         assert!(small < 4096 && small > 4096 - 1024);
         assert_eq!(max_entry_bytes(&cfg(16)), 0);
+    }
+
+    #[tokio::test]
+    async fn replication_read_is_bounded_by_bytes_not_only_entry_count() {
+        let io = FakeIo::new();
+        let mut store = open(&io, 64 << 20);
+        // Three 12 MiB entries are 36 MiB: more than one 32 MiB frame holds, and each one is
+        // below the per-entry limit, so only the read side can keep a request under the cap.
+        append_sync(&mut store, entries(1, 3, 1, 12 << 20)).await;
+        append_sync(&mut store, entries(4, 8, 1, 1 << 20)).await;
+        let mut reader = store.get_log_reader().await;
+
+        // The 12 MiB entries are served one per read (a second would pass the 16 MiB budget)...
+        for index in 1..=3u64 {
+            let got = reader.limited_get_log_entries(index, 4).await.unwrap();
+            assert_eq!(got.len(), 1, "from {index}");
+            assert_eq!(got[0].log_id.index(), index);
+        }
+        // ...while small entries still go in one read, and a read always makes progress.
+        let small = reader.limited_get_log_entries(4, 9).await.unwrap();
+        assert_eq!(small, entries(4, 8, 1, 1 << 20));
+        let total: usize = reader
+            .limited_get_log_entries(1, 9)
+            .await
+            .unwrap()
+            .iter()
+            .map(estimate_size)
+            .sum();
+        assert!(total <= REPLICATION_BATCH_BYTES, "{total}");
+
+        // The unlimited read (apply path, truncation checks) must still return everything.
+        assert_eq!(reader.try_get_log_entries(1..=8).await.unwrap().len(), 8);
+        store.shutdown().await;
     }
 
     #[tokio::test]

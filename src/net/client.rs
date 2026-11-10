@@ -57,7 +57,10 @@ pub struct TcpNetConfig {
     pub cluster_id: u64,
     /// This node's id (announced in the Hello).
     pub node_id: u64,
-    /// Frame cap for the replication and heartbeat lanes (default 32 MiB).
+    /// Frame cap for the replication and heartbeat lanes (default 32 MiB). Keep it at least
+    /// twice [`REPLICATION_BATCH_BYTES`](crate::wal::store::REPLICATION_BATCH_BYTES), the byte
+    /// budget of one AppendEntries batch; a smaller cap can refuse a batch of large entries and
+    /// stall replication to that peer.
     pub max_frame_len: usize,
     /// Time allowed for the Hello exchange (default 5 s).
     pub handshake_timeout: Duration,
@@ -755,6 +758,14 @@ async fn append_writer<S>(
             }
         };
         if HEADER_LEN + body.len() > frame_cap {
+            // Replication to this follower cannot pass this request. Make the wedge visible: the
+            // log store bounds a batch by bytes, so this means a frame cap far below its budget.
+            tracing::error!(
+                request_bytes = HEADER_LEN + body.len(),
+                frame_cap,
+                "AppendEntries request exceeds the frame cap; replication to this peer is stuck \
+                 until max_frame_len is raised"
+            );
             let too_large = FrameError::TooLarge {
                 declared: HEADER_LEN + body.len(),
                 max: frame_cap,
@@ -852,6 +863,14 @@ impl ResponseReader {
 mod tests {
     use super::*;
     use tokio::net::TcpListener;
+
+    #[test]
+    fn default_frame_cap_holds_a_full_replication_batch() {
+        let cfg = TcpNetConfig::new(1, 1, PathBuf::new());
+        // A batch is at most the budget, or one entry (under 16 MiB) when that is larger.
+        let worst = crate::wal::store::REPLICATION_BATCH_BYTES.max(16 * 1024 * 1024);
+        assert!(cfg.max_frame_len >= 2 * worst, "{} vs {worst}", cfg.max_frame_len);
+    }
 
     #[tokio::test]
     async fn keepalive_is_enabled_on_sockets_the_config_touches() {
