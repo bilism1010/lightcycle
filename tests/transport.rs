@@ -1423,6 +1423,29 @@ async fn snapshot_bad_offset_rejected() {
 }
 
 #[tokio::test]
+async fn shutdown_waits_for_connections_to_remove_their_receive_files() {
+    let td = tempfile::tempdir().unwrap();
+    let recv_dir = td.path().join("recv");
+    let stub = Arc::new(StubHandler::default());
+    let server = start_snapshot_server(stub.clone(), &recv_dir, 64 * 1024, 4, IDLE, |_| {}).await;
+    let stats = server.stats();
+    let mut framed = raw_conn(&server, Lane::Snapshot).await;
+    framed.send(begin_frame(1000)).await.unwrap();
+    framed.send(chunk_frame(0, 100)).await.unwrap();
+    eventually("first chunk accepted", || {
+        stats.snapshot_chunks.load(Ordering::Relaxed) == 1
+    })
+    .await;
+    assert_eq!(dir_entries(&recv_dir).len(), 1, "a receive file exists mid-transfer");
+
+    // The sender is still connected and mid-transfer. Once shutdown returns the connection task
+    // must be finished, so its guard has already removed the file: no polling needed.
+    server.shutdown().await;
+    assert!(dir_entries(&recv_dir).is_empty(), "{:?}", dir_entries(&recv_dir));
+    drop(framed);
+}
+
+#[tokio::test]
 async fn snapshot_over_declared_size_rejected() {
     let td = tempfile::tempdir().unwrap();
     let recv_dir = td.path().join("recv");

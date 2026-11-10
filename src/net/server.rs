@@ -139,6 +139,9 @@ impl Drop for PeerServer {
     }
 }
 
+/// How long `shutdown` waits for connection tasks to finish after cancelling them.
+const CONNECTION_DRAIN_GRACE: Duration = Duration::from_secs(5);
+
 /// Server-wide resource caps shared by every connection.
 #[derive(Clone)]
 struct Limits {
@@ -185,8 +188,31 @@ async fn accept_loop(
                     tokio::time::sleep(Duration::from_millis(50)).await;
                 }
             },
-            Some(_) = conns.join_next(), if !conns.is_empty() => {}
+            Some(joined) = conns.join_next(), if !conns.is_empty() => {
+                // A cancelled task is ordinary teardown; a panic would otherwise vanish silently.
+                if let Err(e) = joined {
+                    if !e.is_cancelled() {
+                        tracing::warn!(error = %e, "peer connection task failed");
+                    }
+                }
+            }
         }
+    }
+    // The connection tasks watch child tokens of `cancel` and are already winding down. Wait for
+    // them (bounded) so their guards have removed receive files and finished in-flight blocking
+    // writes before `shutdown()` returns; whatever outlasts the grace period is aborted on drop.
+    let drained = tokio::time::timeout(CONNECTION_DRAIN_GRACE, async {
+        while let Some(joined) = conns.join_next().await {
+            if let Err(e) = joined {
+                if !e.is_cancelled() {
+                    tracing::warn!(error = %e, "peer connection task failed");
+                }
+            }
+        }
+    })
+    .await;
+    if drained.is_err() {
+        tracing::warn!(open = conns.len(), "peer connections still open after the shutdown grace");
     }
 }
 
