@@ -171,15 +171,19 @@ async fn main() -> anyhow::Result<()> {
     let peers = parse_peers(&config.peers).context("invalid --peers")?;
     // A standalone node (no peers) always initializes its own single-member cluster, so it goes
     // through the same code path, WAL included, as a clustered node (decision D-14).
-    let bootstrap = config.bootstrap || peers.is_empty();
-    if peers.is_empty() && !config.bootstrap {
+    let standalone = peers.is_empty();
+    let bootstrap = config.bootstrap || standalone;
+    if standalone && !config.bootstrap {
         // An empty peer list is easy to produce by accident (a typo, a template that expanded to
-        // nothing, a node meant to join later). A fresh data directory would then start its own
-        // independent cluster, which can never be merged into the real one: say so loudly.
+        // nothing, a node meant to join later). The initialization below follows immediately, so
+        // this states what is happening rather than offering a chance to stop: a standalone
+        // cluster can never be merged into a real one and is undone only by wiping the data
+        // directory.
         eprintln!(
-            "[Lightcycle] WARNING: no --peers given, so node {} will initialize a standalone \
-             one-node cluster if {} holds no cluster state. If this node is meant to join an \
-             existing cluster, stop now and pass --peers.",
+            "[Lightcycle] WARNING: no --peers given, so node {} is starting as a standalone \
+             one-node cluster and will initialize it now if {} holds no cluster state. That \
+             cannot be undone without wiping the directory. A node meant to join an existing \
+             cluster must be started with --peers.",
             config.node_id,
             config.data_dir().display()
         );
@@ -249,7 +253,7 @@ async fn main() -> anyhow::Result<()> {
     };
     members.insert(config.node_id, BasicNode { addr: advertise });
     match node.bootstrap_if_needed(members).await {
-        Ok(true) if config.peers.is_empty() => println!(
+        Ok(true) if standalone => println!(
             "[Lightcycle] node {} initialized a new standalone single-node cluster",
             config.node_id
         ),
