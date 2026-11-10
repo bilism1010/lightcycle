@@ -284,7 +284,20 @@ async fn partition_heals_and_minority_converges() {
     let mut expected = expect_map("a", 0..10);
     cluster.wait_converged(&[1, 2, 3], &expected).await;
 
+    // Cut the old leader off and, before it notices (it steps down once its lease lapses, after
+    // which a write is refused up front), hand it a write it can append but never replicate.
+    let log_before = cluster.node(old_leader).metrics().last_log_index;
     cluster.ctl.isolate(old_leader);
+    let isolated_write = {
+        let raft = cluster.node(old_leader).raft().clone();
+        tokio::spawn(async move { raft.client_write(set_req("minority-only", "must-not-commit")).await })
+    };
+    eventually(Duration::from_secs(5), "the isolated leader to append the uncommitted entry", || {
+        let after = cluster.node(old_leader).metrics().last_log_index;
+        async move { after > log_before }
+    })
+    .await;
+
     let majority: Vec<u64> = (1..=3).filter(|id| *id != old_leader).collect();
     let new_leader = cluster.leader_among(&majority).await;
     assert_ne!(new_leader, old_leader);
@@ -298,13 +311,11 @@ async fn partition_heals_and_minority_converges() {
     expected.extend(expect_map("b", 0..10));
     cluster.wait_converged(&majority, &expected).await;
 
-    // The isolated old leader cannot commit: its write never returns Ok.
-    let res = tokio::time::timeout(
-        Duration::from_secs(2),
-        cluster.node(old_leader).write(set_req("minority-only", "must-not-commit")),
-    )
-    .await;
-    assert!(!matches!(res, Ok(Ok(_))), "isolated leader committed a write: {res:?}");
+    // The isolated old leader cannot commit the entry it appended: the write never returns Ok.
+    if isolated_write.is_finished() {
+        let outcome = isolated_write.await.expect("write task");
+        assert!(outcome.is_err(), "isolated leader committed a write: {outcome:?}");
+    }
 
     // Heal: the old leader steps down, discards its uncommitted entry and converges.
     cluster.ctl.heal();
@@ -318,6 +329,13 @@ async fn partition_heals_and_minority_converges() {
         cluster.node(old_leader).engine().get(b"minority-only").is_none(),
         "the uncommitted write must be absent"
     );
+    // The divergent entry was truncated away: the old leader's log now matches the leader's.
+    eventually(Duration::from_secs(15), "old leader's log converges to the leader's", || {
+        let old = cluster.node(old_leader).metrics().last_log_index;
+        let lead = cluster.node(new_leader).metrics().last_log_index;
+        async move { old == lead }
+    })
+    .await;
 }
 
 /// Crash a node with a genuinely torn WAL tail (decision D-16): its fsync is delayed while writes
