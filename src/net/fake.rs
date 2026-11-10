@@ -30,19 +30,9 @@ use parking_lot::Mutex;
 use crate::net::handler::RaftHandler;
 use crate::raft::types::{SnapshotFile, TypeConfig};
 
-/// Which of the three per-peer connections a client represents (interpretation A4).
-///
-/// Mirrors the wire-level lane tag; kept local so the fake network does not depend on the wire
-/// module.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Lane {
-    /// Pipelined log replication.
-    Replication,
-    /// Heartbeats, isolated from bulk traffic.
-    Heartbeat,
-    /// Snapshot transfer.
-    Snapshot,
-}
+/// Which of the three per-peer connections a client represents (interpretation A4): the same
+/// type the TCP transport tags its connections with.
+pub use crate::wire::frame::Lane;
 
 /// Delivered and dropped call counts for one lane.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

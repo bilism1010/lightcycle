@@ -127,6 +127,9 @@ impl Frame {
 pub struct FrameCodec {
     inner: LengthDelimitedCodec,
     max_frame_length: usize,
+    /// The inner codec has consumed the length prefix of a frame whose body is still incomplete.
+    /// While set, the buffer front is body bytes and must not be read as a length prefix.
+    mid_frame: bool,
 }
 
 impl FrameCodec {
@@ -140,6 +143,7 @@ impl FrameCodec {
         FrameCodec {
             inner,
             max_frame_length,
+            mid_frame: false,
         }
     }
 
@@ -162,7 +166,12 @@ impl Decoder for FrameCodec {
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Frame>, FrameError> {
         // Check the declared length ourselves so the error carries the declared size and fires
         // from the prefix alone, before the inner codec reserves any body capacity.
-        if src.len() >= LENGTH_PREFIX_LEN {
+        //
+        // The inner codec consumes the prefix as soon as it is complete and then waits for the
+        // body, so on a later call for the same frame the buffer front is body data. Only peek
+        // at the front when the inner codec is expecting a prefix.
+        let prefix_pending = !self.mid_frame && src.len() >= LENGTH_PREFIX_LEN;
+        if prefix_pending {
             let declared =
                 u32::from_be_bytes([src[0], src[1], src[2], src[3]]) as usize;
             if declared > self.max_frame_length {
@@ -173,8 +182,11 @@ impl Decoder for FrameCodec {
             }
         }
         let Some(mut payload) = self.inner.decode(src)? else {
+            // A complete prefix was consumed but the body is still arriving.
+            self.mid_frame = self.mid_frame || prefix_pending;
             return Ok(None);
         };
+        self.mid_frame = false;
         if payload.len() < HEADER_LEN {
             return Err(FrameError::Truncated);
         }
@@ -284,6 +296,43 @@ mod tests {
         }
         assert_eq!(buf.capacity(), cap_before, "buffer must not grow");
         assert_eq!(buf.len(), 4);
+    }
+
+    #[test]
+    fn frame_split_across_reads_decodes_even_if_body_looks_like_a_huge_prefix() {
+        // Regression: the cap check used to re-read the buffer front on every call, so a frame
+        // whose body began with 0x10000000 (268435456, above the cap) was rejected whenever its
+        // body arrived in a later read than its prefix.
+        let mut codec = FrameCodec::new(1024);
+        let body: Vec<u8> = [0x10, 0x00, 0x00, 0x00]
+            .iter()
+            .copied()
+            .chain(std::iter::repeat_n(0xab, 200))
+            .collect();
+        let frame = Frame::new(KIND_APP_BASE, Lane::Replication, 9, Bytes::from(body));
+        let mut wire = BytesMut::new();
+        codec.encode(frame.clone(), &mut wire).unwrap();
+
+        // Feed the prefix plus header first, then the rest in small pieces.
+        let mut buf = BytesMut::new();
+        let cut = LENGTH_PREFIX_LEN + HEADER_LEN;
+        buf.extend_from_slice(&wire[..cut]);
+        assert!(codec.decode(&mut buf).unwrap().is_none());
+        for piece in wire[cut..].chunks(37) {
+            buf.extend_from_slice(piece);
+            if let Some(decoded) = codec.decode(&mut buf).unwrap() {
+                assert_eq!(decoded, frame);
+                assert!(buf.is_empty());
+                // The next frame starts afresh: its prefix is checked against the cap again.
+                buf.extend_from_slice(&(1u32 << 20).to_be_bytes());
+                assert!(matches!(
+                    codec.decode(&mut buf),
+                    Err(FrameError::TooLarge { .. })
+                ));
+                return;
+            }
+        }
+        panic!("frame never completed");
     }
 
     #[test]
