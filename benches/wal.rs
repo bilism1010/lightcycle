@@ -96,7 +96,12 @@ fn drive(h: &mut WalHandle<Vec<u8>>, ops: usize, window: usize) -> Vec<u64> {
     while inflight.load(Ordering::Acquire) > 0 {
         std::thread::yield_now();
     }
-    slots.iter().map(|s| s.load(Ordering::Acquire)).collect()
+    let lat: Vec<u64> = slots.iter().map(|s| s.load(Ordering::Acquire)).collect();
+    // A failed ack is recorded as u64::MAX; it is not a latency, and a failing (fast-erroring)
+    // write path must never produce numbers that look like a fast WAL.
+    let failed = lat.iter().filter(|&&v| v == u64::MAX).count();
+    assert_eq!(failed, 0, "{failed} of {ops} appends failed; latencies are not meaningful");
+    lat
 }
 
 fn fsync_report(label: &str, stats: &WalStats) {
@@ -161,7 +166,9 @@ fn bench_wal(c: &mut Criterion) {
                     }
                 }
             }
-            black_box(rx.recv().expect("ack"))
+            let result = rx.recv().expect("ack");
+            assert!(result.is_ok(), "append failed; the round-trip figure is not meaningful");
+            black_box(result)
         })
     });
     g.finish();
