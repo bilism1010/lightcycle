@@ -32,7 +32,7 @@ or protocol change whose semantics (not just syntax) should be confirmed by a pe
 
 ## Fixed Issues
 
-### CR-01: Corruption in the last segment is treated as a torn tail
+### CR-01: Corruption in the last segment is treated as a torn tail and silently drops acknowledged records
 **Status:** fixed: requires human verification
 **Files modified:** `src/wal/recovery.rs`
 **Commit:** dad0a11
@@ -44,7 +44,7 @@ record (still repaired as a tear), damaged preamble with records behind it. Trad
 that persists unsynced pages out of order could leave a valid record behind a torn one; that now needs operator
 attention instead of silently discarding data.
 
-### CR-02: Oversized entries dropped silently, leaving an index gap
+### CR-02: Oversized entries are not rejected up front; the writer can drop them silently and leave a durable index gap
 **Status:** fixed: requires human verification
 **Files modified:** `src/wal/store.rs`, `src/wal/writer.rs`, `src/raft/node.rs`, `src/raft/types.rs`, `tests/cluster.rs`
 **Commit:** 6e657cc
@@ -56,28 +56,28 @@ new `NodeError::RequestTooLarge` before proposing it (an `Err` from the log stor
 the writer does not check `index == next_index`; that rule needs a decision on fresh-log and post-truncate start
 indexes the review does not settle. The 1 KiB envelope reserve and the segment-size reserve are my choices.
 
-### CR-03: Wildcard `--bind` published into membership
+### CR-03: Wildcard `--bind` publishes an unroutable address (`0.0.0.0:port`) into replicated cluster membership
 **Status:** fixed
 **Files modified:** `src/main.rs`, `README.md`
 **Commit:** 48b2983
 **Applied fix:** New `--advertise <host:port>`; the bootstrap node publishes it (port 0 takes the bound port). With
 no `--advertise`, a wildcard bound address is refused with a clear error. Unit tests cover the cases.
 
-### WR-01: Flushed watermark raised past the truncation point
+### WR-01: Flushed watermark is raised past the truncation point when entries and a truncate marker share a batch
 **Status:** fixed: requires human verification
 **Files modified:** `src/wal/writer.rs`
 **Commit:** 21c4f2f
 **Applied fix:** The clamp is re-applied after `write_run` in the `TruncateAfter` arm (`clamp_unreported`). A
 regression test fails without the fix (reproduced first: flushed 10 above log end 6).
 
-### WR-02: Purge deleted files before the index dropped the entries
+### WR-02: Purge deletes segment files before the index and cache drop the entries, so concurrent readers get a spurious I/O error
 **Status:** fixed: requires human verification
 **Files modified:** `src/wal/writer.rs`
 **Commit:** 8bd6625
 **Applied fix:** `observer.on_purge` now runs after the marker is durable and before the segment deletions. A
 test observes that the segments still exist at `on_purge` time.
 
-### WR-03: Recovery capped reads at the configured segment size
+### WR-03: Recovery caps reads at the configured segment size, then destroys anything beyond it
 **Status:** fixed: requires human verification
 **Files modified:** `src/wal/recovery.rs`
 **Commit:** 4ae41f2
@@ -85,7 +85,7 @@ test observes that the segments still exist at `on_purge` time.
 instead of shrinking. Test reopens 4096-byte segments with a 2048-byte config. `WalHandle::spawn` already rejects a
 tail beyond the configured size with a `Config` error, so no extra check was added.
 
-### WR-04: Recovery never validated the start of the surviving log
+### WR-04: Recovery never validates that the surviving log starts where the purge point says it should
 **Status:** fixed: requires human verification
 **Files modified:** `src/wal/recovery.rs`
 **Commit:** add3edd
@@ -95,7 +95,7 @@ inside `Scanner::apply` was tried and removed, because it rejects a valid log (a
 older purge point than a later marker in the same segment; real cluster tests failed on it). Only the final-state
 check is correct.
 
-### WR-05: Snapshot store not serialized against build/install
+### WR-05: Snapshot store is not serialized against concurrent build / install / `get_current_snapshot`; a lost race becomes a spurious I/O error
 **Status:** fixed: requires human verification
 **Files modified:** `src/snapshot/store.rs`, `src/raft/state_machine.rs`
 **Commit:** 1151d7b
@@ -103,14 +103,14 @@ check is correct.
 vanishes; `install_snapshot` takes `build_lock` until the engine swap. A test shows install waits for an in-flight
 build.
 
-### WR-06: Failed rename leaked the snapshot `.tmp`
+### WR-06: A failed `rename` in `build_with_hook` leaks a full-size `.tmp`; the test named for this behaviour does not assert it
 **Status:** fixed
 **Files modified:** `src/snapshot/store.rs`
 **Commit:** 43d8196
 **Applied fix:** The `.tmp` is removed when the publishing rename fails (hook "crash" paths keep it). The test now
 asserts the file is gone.
 
-### WR-07: Empty `--peers` silently starts a one-node cluster
+### WR-07: A node started with no `--peers` silently initializes its own one-node cluster
 **Status:** fixed: requires human verification (partial)
 **Files modified:** `src/main.rs`
 **Commit:** aff0012
@@ -119,7 +119,7 @@ and the init message says "standalone single-node cluster". The stricter option 
 was not taken: it changes the documented CLI contract and the existing `cli_smoke` test and README quickstart, which
 is a product decision.
 
-### WR-08: Unsupported snapshot version reported as "wipe this node"
+### WR-08: Any unreadable-header error is reported as "wipe this node", including a snapshot written by a newer format version
 **Status:** fixed
 **Files modified:** `src/snapshot/format.rs`, `src/snapshot/store.rs`, `src/raft/state_machine.rs`
 **Commit:** c7a4374
@@ -128,14 +128,14 @@ snapshot body found by `KvStateMachine::open` now gets the same wipe guidance as
 `SnapshotStore::open` still deletes older snapshots before validating the newest (the review notes the no-fallback
 policy explains it).
 
-### WR-09: Client never checked which node answered
+### WR-09: Client never checks that the node it connected to is the intended target
 **Status:** fixed: requires human verification
 **Files modified:** `src/wire/hello.rs`, `src/wire/mod.rs`, `src/net/client.rs`, `tests/transport.rs`
 **Commit:** a3b5310
 **Applied fix:** New `client_handshake_expecting` and `HandshakeError::NodeMismatch`; `PeerClient::ensure_conn`
 passes its target node id and the lane is checked. `client_handshake` keeps its signature. Unit and TCP tests added.
 
-### WR-10: No bound on connections or concurrent snapshot receives
+### WR-10: No bound on concurrent connections or concurrent snapshot receives; per-connection memory and disk are large
 **Status:** fixed: requires human verification (partial)
 **Files modified:** `src/net/client.rs`, `src/net/server.rs`, `tests/transport.rs`
 **Commit:** a9bd42b
@@ -144,7 +144,7 @@ are closed); `max_snapshot_receives` (default 2) refuses an extra `SNAP_BEGIN` w
 are my choice. Not done: the free-space check before creating the receive file (needs a new dependency and a
 platform-specific call) and a lower pre-app-frame cap.
 
-### WR-11: No idle detection, keepalive or write timeout
+### WR-11: No idle detection, TCP keepalive or write timeout on replication/heartbeat connections, or on an idle snapshot connection
 **Status:** fixed: requires human verification (partial)
 **Files modified:** `Cargo.toml`, `Cargo.lock`, `src/net/client.rs`, `src/net/server.rs`, `tests/transport.rs`
 **Commit:** 1504483
@@ -153,7 +153,7 @@ direct dependency, already in the lockfile), a per-frame `write_timeout` (30 s) 
 `heartbeat_idle_timeout` (60 s) on the heartbeat-lane reader. Not done: idle bounds on the replication and the
 idle snapshot lanes (the review leaves their values open; keepalive covers them). The write timeout has no test.
 
-### WR-12: Writer task aborted before the final frame was flushed
+### WR-12: Writer task is aborted without draining, so the final response/error frame can be lost
 **Status:** fixed: requires human verification
 **Files modified:** `src/net/server.rs`, `tests/transport.rs`
 **Commit:** 5819988
@@ -161,7 +161,7 @@ idle snapshot lanes (the review leaves their values open; keepalive covers them)
 `ERROR_SEND_TIMEOUT`) before it is aborted; server shutdown skips the courtesy. The new test failed on the old code
 (the Fatal reason was lost) and now passes 40 rounds on a multi-thread runtime.
 
-### WR-13: Unary client reused a connection the server closed after Conflict/HigherVote
+### WR-13: Server closes the connection after every Conflict/HigherVote AppendEntries result, but the unary client path reuses the connection
 **Status:** fixed: requires human verification (partial)
 **Files modified:** `src/net/client.rs`, `tests/transport.rs`
 **Commit:** 581a9bd
@@ -169,7 +169,7 @@ idle snapshot lanes (the review leaves their values open; keepalive covers them)
 redials on purpose. The stub handler learned to end its session after a Conflict, as openraft does; the test failed
 before the fix. Not done: the server-side option (restart the `AppendSession` instead of closing the socket).
 
-### WR-14: Snapshot install response used the per-chunk idle timeout
+### WR-14: Snapshot response is awaited with the 30 s per-chunk idle timeout, but install includes full double validation of up to 8 GiB
 **Status:** fixed: requires human verification
 **Files modified:** `src/net/client.rs`, `tests/transport.rs`
 **Commit:** 9a05929
@@ -177,7 +177,7 @@ before the fix. Not done: the server-side option (restart the `AppendSession` in
 Test: a 900 ms install against a 300 ms idle bound succeeds. The default is my choice; the optional server
 keep-alive ack was not added.
 
-### WR-15: Vote/pre-vote failures reported as non-fatal
+### WR-15: Vote/pre-vote handler errors are always reported as non-fatal although they can only be Fatal
 **Status:** fixed
 **Files modified:** `src/net/server.rs`, `tests/transport.rs`
 **Commit:** 411c924
@@ -187,7 +187,7 @@ keep-alive ack was not added.
 and the non-fatal client path it used to cover is kept by `non_fatal_remote_failure_is_network_and_keeps_connection`
 (a hand-rolled peer that sends a non-fatal error frame).
 
-### WR-16: Second-crash torn-tail assertion was vacuous
+### WR-16: Second-crash torn-tail assertion is vacuous
 **Status:** fixed
 **Files modified:** `tests/cluster.rs`
 **Commit:** 2adca58
@@ -195,7 +195,7 @@ and the non-fatal client path it used to cover is kept by `non_fatal_remote_fail
 principle end exactly on a record boundary, the leader crash is retried up to 5 times rather than weakening the
 assertion.
 
-### WR-17: "Uncommitted write is discarded" had no evidence the entry was appended
+### WR-17: "Uncommitted write is discarded" has no evidence the write was ever appended
 **Status:** fixed
 **Files modified:** `tests/cluster.rs`
 **Commit:** fed4a26
@@ -204,13 +204,13 @@ stepped down and refused the write with `NotLeader`, so the discard path was nev
 the write to the old leader immediately after isolating it, waits until its `last_log_index` advances, and after
 healing also checks the old leader's log index converges to the new leader's.
 
-### WR-18: Exact-count assertions after a fixed 300 ms sleep
+### WR-18: Exact-count assertions after a fixed 300 ms sleep (flaky on loaded hosts)
 **Status:** fixed
 **Files modified:** `tests/transport.rs`
 **Commit:** 168df90
 **Applied fix:** Wait for the window to fill, then hold it 100 ms and assert the count did not exceed it.
 
-### WR-19: Absolute wall-clock bounds in the heartbeat starvation test
+### WR-19: `snapshot_does_not_starve_heartbeat` relies on absolute wall-clock bounds
 **Status:** fixed
 **Files modified:** `tests/transport.rs`
 **Commit:** 70f0c90
@@ -219,14 +219,14 @@ under 2 s, and at least one heartbeat must complete while snapshot chunks are st
 evidence). Deliberately not the review's `max < 1 s` alone: that is above the 300 ms install delay and would stop
 detecting starvation behind the install.
 
-### WR-20: WAL bench used `tempfile::tempdir()` (often tmpfs)
+### WR-20: WAL bench "fsync" scenarios use `tempfile::tempdir()`, which is often tmpfs on Linux
 **Status:** fixed
 **Files modified:** `benches/wal.rs`
 **Commit:** 974363e
 **Applied fix:** `LC_WAL_BENCH_DIR` selects the parent directory; the `[info]` line prints it. The optional
 `statfs` tmpfs warning was not added.
 
-### WR-21: Bench counted failed acks as latencies
+### WR-21: Bench counts failed acks as latencies and cannot detect a failing WAL
 **Status:** fixed
 **Files modified:** `benches/wal.rs`
 **Commit:** b15a566
