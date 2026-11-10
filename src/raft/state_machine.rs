@@ -1,9 +1,9 @@
 //! The Raft state machine core: applies committed log entries to the stamped [`LocalEngine`].
 //!
-//! This module holds everything about the state machine that does not need snapshot files: the
-//! [`KvStateMachine`] (engine handle, last applied log id, last membership), the [`ApplySink`] seam
-//! and the default [`InlineSink`]. The openraft `RaftStateMachine` trait impl (snapshot build and
-//! install) lands in plan 03-12 on top of this core.
+//! This module holds the [`KvStateMachine`] (engine handle, last applied log id, last membership),
+//! the [`ApplySink`] seam and the default [`InlineSink`], plus (plan 03-12) the openraft
+//! `RaftStateMachine` implementation that connects the core to the on-disk snapshot store:
+//! chunked apply, fuzzy snapshot builds that run off the runtime, and whole-engine install.
 //!
 //! # R-3 resolution: the apply seam
 //!
@@ -26,15 +26,45 @@
 //! scan plus log replay equal to sequential apply; the tests at the bottom of this file are the
 //! executable proof (decision D-09).
 
+use std::io;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
+use futures::{Stream, StreamExt};
 use openraft::entry::EntryPayload;
-use openraft::type_config::alias::{EntryOf, LogIdOf, StoredMembershipOf};
-use openraft::StoredMembership;
+use openraft::storage::{EntryResponder, RaftSnapshotBuilder, RaftStateMachine, Snapshot};
+use openraft::type_config::alias::{
+    EntryOf, LogIdOf, SnapshotMetaOf, SnapshotOf, StoredMembershipOf,
+};
+use openraft::{OptionalSend, StoredMembership};
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 use crate::engine::{ApplyOutcome, LocalEngine};
-use crate::raft::types::{KvRequest, KvResponse, TypeConfig};
+use crate::raft::types::{KvRequest, KvResponse, SnapshotFile, TypeConfig};
+use crate::snapshot::{load_snapshot, Meta, SnapshotError, SnapshotStore};
+
+/// Entries applied between cooperative yields to the scheduler (assumption A8). openraft hands
+/// the state machine up to 4096 entries per `apply`, so this bounds how long one call can hold a
+/// runtime thread (a yield every 256 entries gives at least 16 per full batch).
+const APPLY_YIELD_EVERY: usize = 256;
+
+/// Map a snapshot error to the `io::Error` openraft's storage traits speak.
+fn snapshot_io_error(e: SnapshotError) -> io::Error {
+    match e {
+        SnapshotError::Io(e) => e,
+        SnapshotError::CorruptNeedsWipe => io::Error::new(
+            io::ErrorKind::InvalidData,
+            "latest snapshot is corrupt and the log below it was purged: wipe this node's data \
+             directory and rejoin the cluster",
+        ),
+        other => io::Error::new(io::ErrorKind::InvalidData, other),
+    }
+}
+
+fn join_error(e: tokio::task::JoinError) -> io::Error {
+    io::Error::other(format!("blocking snapshot task failed: {e}"))
+}
 
 /// Shared, swappable handle to the live engine. Readers keep their `Arc<LocalEngine>` across a
 /// swap, so a restored engine can be installed without blocking them.
@@ -73,6 +103,10 @@ pub struct KvStateMachine {
     sink: Arc<dyn ApplySink>,
     last_applied: Option<LogIdOf<TypeConfig>>,
     last_membership: StoredMembershipOf<TypeConfig>,
+    /// Snapshot directory handle; `None` for the in-memory constructors.
+    snapshots: Option<Arc<SnapshotStore>>,
+    /// Held for the whole duration of a snapshot build so builds never overlap (pitfall 11).
+    build_lock: Arc<AsyncMutex<()>>,
 }
 
 impl Default for KvStateMachine {
@@ -94,6 +128,49 @@ impl KvStateMachine {
             sink,
             last_applied: None,
             last_membership: StoredMembership::default(),
+            snapshots: None,
+            build_lock: Arc::new(AsyncMutex::new(())),
+        }
+    }
+
+    /// Open a state machine backed by the snapshot directory `snapshot_dir`. If a snapshot exists
+    /// it is fully validated and loaded, and its log id and membership become the applied state;
+    /// the caller replays any later log entries. A corrupt latest snapshot is a hard error.
+    pub async fn open(snapshot_dir: impl Into<PathBuf>) -> Result<KvStateMachine, io::Error> {
+        let dir = snapshot_dir.into();
+        let (store, restored) = tokio::task::spawn_blocking(move || {
+            let store = SnapshotStore::open(dir)?;
+            let restored = match store.latest()? {
+                Some((_, file)) => Some(load_snapshot(&file.path)?),
+                None => None,
+            };
+            Ok::<_, SnapshotError>((store, restored))
+        })
+        .await
+        .map_err(join_error)?
+        .map_err(snapshot_io_error)?;
+
+        let mut sm = Self::new();
+        sm.snapshots = Some(Arc::new(store));
+        if let Some((meta, engine)) = restored {
+            sm.replace_engine(engine, meta.last_log_id, meta.last_membership);
+        }
+        Ok(sm)
+    }
+
+    /// Capture the snapshot start state: the current engine, `last_applied` and `last_membership`.
+    /// Must be called serialized with apply (openraft calls the builder methods with `&mut self`
+    /// between apply commands), so the three values are one consistent cut.
+    fn snapshot_builder(&self, guard: Option<OwnedMutexGuard<()>>) -> KvSnapshotBuilder {
+        KvSnapshotBuilder {
+            store: self.snapshots.clone(),
+            engine: self.engine.load_full(),
+            meta: Meta {
+                last_log_id: self.last_applied.clone(),
+                last_membership: self.last_membership.clone(),
+            },
+            lock: Arc::clone(&self.build_lock),
+            guard,
         }
     }
 
@@ -146,6 +223,126 @@ impl KvStateMachine {
     }
 }
 
+/// Builds one fuzzy snapshot from the engine and metadata captured when the builder was created.
+pub struct KvSnapshotBuilder {
+    store: Option<Arc<SnapshotStore>>,
+    engine: Arc<LocalEngine>,
+    meta: Meta,
+    lock: Arc<AsyncMutex<()>>,
+    /// Present when created by `try_create_snapshot_builder`; otherwise acquired in the build.
+    guard: Option<OwnedMutexGuard<()>>,
+}
+
+impl RaftSnapshotBuilder<TypeConfig> for KvSnapshotBuilder {
+    type SnapshotData = SnapshotFile;
+
+    async fn build_snapshot(&mut self) -> Result<SnapshotOf<TypeConfig, SnapshotFile>, io::Error> {
+        let store = self.store.clone().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::Unsupported, "snapshots are not configured")
+        })?;
+        if self.guard.is_none() {
+            self.guard = Some(Arc::clone(&self.lock).lock_owned().await);
+        }
+        let engine = Arc::clone(&self.engine);
+        let meta = self.meta.clone();
+        // The scan is a read-only walk of the whole engine: keep it off the async runtime. The
+        // store syncs the file, renames it and syncs the directory before this returns, so the
+        // log purge openraft performs next can never outrun the snapshot (pitfall 3, T-03-30).
+        let result = tokio::task::spawn_blocking(move || {
+            let file = store.build(&engine, &meta)?;
+            Ok::<_, SnapshotError>((meta, file))
+        })
+        .await;
+        // Release the build slot as soon as the build is over, success or not.
+        self.guard = None;
+        let (meta, file) = result.map_err(join_error)?.map_err(snapshot_io_error)?;
+        Ok(Snapshot { meta, snapshot: file })
+    }
+}
+
+impl RaftStateMachine<TypeConfig> for KvStateMachine {
+    type SnapshotData = SnapshotFile;
+    type SnapshotBuilder = KvSnapshotBuilder;
+
+    async fn applied_state(
+        &mut self,
+    ) -> Result<(Option<LogIdOf<TypeConfig>>, StoredMembershipOf<TypeConfig>), io::Error> {
+        Ok(KvStateMachine::applied_state(self))
+    }
+
+    async fn apply<Strm>(&mut self, mut entries: Strm) -> Result<(), io::Error>
+    where Strm: Stream<Item = Result<EntryResponder<TypeConfig>, io::Error>> + Unpin + OptionalSend
+    {
+        let mut applied = 0usize;
+        while let Some(item) = entries.next().await {
+            let (entry, responder) = item?;
+            let response = self.apply_entry(&entry);
+            if let Some(responder) = responder {
+                responder.send(response);
+            }
+            applied += 1;
+            if applied % APPLY_YIELD_EVERY == 0 {
+                tokio::task::yield_now().await;
+            }
+        }
+        Ok(())
+    }
+
+    async fn try_create_snapshot_builder(&mut self, _force: bool) -> Option<KvSnapshotBuilder> {
+        let guard = Arc::clone(&self.build_lock).try_lock_owned().ok()?;
+        Some(self.snapshot_builder(Some(guard)))
+    }
+
+    async fn get_snapshot_builder(&mut self) -> KvSnapshotBuilder {
+        self.snapshot_builder(None)
+    }
+
+    async fn install_snapshot(
+        &mut self,
+        meta: &SnapshotMetaOf<TypeConfig>,
+        snapshot: SnapshotFile,
+    ) -> Result<(), io::Error> {
+        // Order is fixed (D-09): validate + load into a fresh engine, make the file durable as
+        // the single current snapshot, and only then swap the engine. Any failure before the
+        // swap changes nothing, so a corrupt or mismatched file can never replace live state
+        // (T-03-31).
+        let store = self.snapshots.clone().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::Unsupported, "snapshots are not configured")
+        })?;
+        let expected = meta.clone();
+        let path = snapshot.path;
+        let engine = tokio::task::spawn_blocking(move || {
+            // The file is validated twice by design (once while loading here, once inside
+            // `install_received`) to keep the failure ordering simple; a single-pass
+            // optimization is out of scope for correctness-focused Phase 3.
+            let (header, engine) = load_snapshot(&path)?;
+            if header != expected {
+                return Err(SnapshotError::MetaMismatch);
+            }
+            store.install_received(&path, &expected)?;
+            Ok::<_, SnapshotError>(engine)
+        })
+        .await
+        .map_err(join_error)?
+        .map_err(snapshot_io_error)?;
+        self.replace_engine(engine, meta.last_log_id.clone(), meta.last_membership.clone());
+        Ok(())
+    }
+
+    async fn get_current_snapshot(
+        &mut self,
+    ) -> Result<Option<SnapshotOf<TypeConfig, SnapshotFile>>, io::Error> {
+        let Some(store) = self.snapshots.clone() else {
+            return Ok(None);
+        };
+        let latest = tokio::task::spawn_blocking(move || store.latest())
+            .await
+            .map_err(join_error)?
+            .map_err(snapshot_io_error)?;
+        Ok(latest.map(|(meta, file)| Snapshot { meta, snapshot: file }))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -168,6 +365,264 @@ mod tests {
 
     fn set(k: &str, v: &str) -> KvRequest {
         KvRequest::Set { key: b(k), value: b(v) }
+    }
+
+    /// An apply stream of `Set key{i} = val{i}` entries for `range`, with no responders.
+    fn set_stream(
+        range: std::ops::RangeInclusive<u64>,
+    ) -> impl Stream<Item = Result<EntryResponder<TypeConfig>, io::Error>> + Unpin {
+        futures::stream::iter(
+            range
+                .map(|i| Ok((normal(i, set(&format!("key{i}"), &format!("val{i}"))), None)))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    /// A mixed Set/Delete stream over seven keys, so later entries overwrite and delete earlier
+    /// ones.
+    fn mixed_stream(
+        range: std::ops::RangeInclusive<u64>,
+    ) -> impl Stream<Item = Result<EntryResponder<TypeConfig>, io::Error>> + Unpin {
+        futures::stream::iter(
+            range
+                .map(|i| {
+                    let key = b(&format!("k{}", i % 7));
+                    let req = if i % 5 == 0 {
+                        KvRequest::Delete { key }
+                    } else {
+                        KvRequest::Set { key, value: b(&format!("v{i}")) }
+                    };
+                    Ok((normal(i, req), None))
+                })
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    /// Names of the published `.snap` files in `dir`, sorted.
+    fn snap_files(dir: &std::path::Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .filter(|n| n.ends_with(".snap"))
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// Copy `snap`'s file into `target`'s staging area, as the network layer would on receive.
+    fn stage_received(target: &KvStateMachine, snap: &SnapshotOf<TypeConfig, SnapshotFile>) -> SnapshotFile {
+        let staging = target.snapshots.as_ref().unwrap().staging_path(&snap.meta);
+        std::fs::copy(&snap.snapshot.path, &staging).unwrap();
+        SnapshotFile { path: staging, len: snap.snapshot.len }
+    }
+
+    /// A machine in `dir` holding `key{i} = val{i}` for `range`, plus a snapshot of it.
+    async fn machine_with_snapshot(
+        dir: &std::path::Path,
+        range: std::ops::RangeInclusive<u64>,
+    ) -> (KvStateMachine, SnapshotOf<TypeConfig, SnapshotFile>) {
+        let mut sm = KvStateMachine::open(dir).await.unwrap();
+        sm.apply(set_stream(range)).await.unwrap();
+        let snap = sm.get_snapshot_builder().await.build_snapshot().await.unwrap();
+        (sm, snap)
+    }
+
+    #[tokio::test]
+    async fn no_overlapping_snapshot_builds() {
+        let mut sm = KvStateMachine::new();
+        let first = sm.try_create_snapshot_builder(false).await;
+        assert!(first.is_some());
+        assert!(sm.try_create_snapshot_builder(false).await.is_none());
+        drop(first);
+        assert!(sm.try_create_snapshot_builder(false).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn build_without_store_reports_not_configured() {
+        let mut sm = KvStateMachine::new();
+        let err = sm.get_snapshot_builder().await.build_snapshot().await.unwrap_err();
+        assert!(err.to_string().contains("not configured"), "{err}");
+        assert!(sm.get_current_snapshot().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn install_snapshot_replaces_state_and_reports_applied() {
+        let (dir_a, dir_b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (_a, snap) = machine_with_snapshot(dir_a.path(), 1..=10).await;
+        let mut b_sm = KvStateMachine::open(dir_b.path()).await.unwrap();
+        b_sm.apply(mixed_stream(1..=4)).await.unwrap();
+        let old_engine = b_sm.engine();
+
+        let received = stage_received(&b_sm, &snap);
+        b_sm.install_snapshot(&snap.meta, received).await.unwrap();
+
+        for i in 1..=10u64 {
+            assert_eq!(
+                b_sm.engine().get(format!("key{i}").as_bytes()),
+                Some(b(&format!("val{i}")))
+            );
+        }
+        assert_eq!(b_sm.engine().get(b"k1"), None, "old contents must be gone");
+        let (applied, membership) = RaftStateMachine::applied_state(&mut b_sm).await.unwrap();
+        assert_eq!(applied, snap.meta.last_log_id);
+        assert_eq!(membership, snap.meta.last_membership);
+        // A reader holding the old Arc still sees the old data.
+        assert_eq!(old_engine.get(b"k1"), Some(b("v1")));
+        assert_eq!(old_engine.get(b"key1"), None);
+    }
+
+    #[tokio::test]
+    async fn engine_handle_tracks_install_snapshot() {
+        let (dir_a, dir_b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (_a, snap) = machine_with_snapshot(dir_a.path(), 1..=10).await;
+        let mut b_sm = KvStateMachine::open(dir_b.path()).await.unwrap();
+        b_sm.apply(mixed_stream(1..=4)).await.unwrap();
+
+        // Cloned out exactly as RaftNode will before the machine moves into Raft::new.
+        let handle = b_sm.engine_handle();
+        let before = handle.load_full();
+
+        let received = stage_received(&b_sm, &snap);
+        b_sm.install_snapshot(&snap.meta, received).await.unwrap();
+
+        let after = handle.load_full();
+        assert!(!Arc::ptr_eq(&before, &after));
+        assert_eq!(after.get(b"key10"), Some(b("val10")));
+        assert_eq!(before.get(b"k1"), Some(b("v1")));
+        assert_eq!(before.get(b"key10"), None);
+        assert!(Arc::ptr_eq(&b_sm.engine(), &after));
+    }
+
+    #[tokio::test]
+    async fn install_rejects_corrupt_file_and_keeps_old_engine() {
+        let (dir_a, dir_b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (_a, snap) = machine_with_snapshot(dir_a.path(), 1..=10).await;
+        let mut b_sm = KvStateMachine::open(dir_b.path()).await.unwrap();
+        b_sm.apply(mixed_stream(1..=4)).await.unwrap();
+        let engine_before = b_sm.engine();
+        let applied_before = KvStateMachine::applied_state(&b_sm);
+        let snaps_before = snap_files(dir_b.path());
+
+        let received = stage_received(&b_sm, &snap);
+        let mut bytes = std::fs::read(&received.path).unwrap();
+        let mid = bytes.len() / 2;
+        bytes[mid] ^= 0x01;
+        std::fs::write(&received.path, &bytes).unwrap();
+
+        let err = b_sm.install_snapshot(&snap.meta, received).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
+        assert!(Arc::ptr_eq(&engine_before, &b_sm.engine()));
+        assert_eq!(b_sm.engine().get(b"k1"), Some(b("v1")));
+        assert_eq!(b_sm.engine().get(b"key1"), None);
+        assert_eq!(KvStateMachine::applied_state(&b_sm), applied_before);
+        assert_eq!(snap_files(dir_b.path()), snaps_before);
+    }
+
+    #[tokio::test]
+    async fn install_rejects_meta_mismatch() {
+        let (dir_a, dir_b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (_a, snap) = machine_with_snapshot(dir_a.path(), 1..=10).await;
+        let mut b_sm = KvStateMachine::open(dir_b.path()).await.unwrap();
+        let received = stage_received(&b_sm, &snap);
+        let mut wrong = snap.meta.clone();
+        wrong.last_log_id = Some(log_id(11));
+        assert!(b_sm.install_snapshot(&wrong, received).await.is_err());
+        assert_eq!(b_sm.engine().get(b"key1"), None);
+        assert!(snap_files(dir_b.path()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn install_keeps_exactly_one_snapshot_on_disk() {
+        let (dir_a, dir_b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (_a, snap) = machine_with_snapshot(dir_a.path(), 1..=10).await;
+        let (mut b_sm, old) = machine_with_snapshot(dir_b.path(), 1..=3).await;
+        assert_eq!(snap_files(dir_b.path()).len(), 1);
+        assert_eq!(old.meta.last_log_id.as_ref().map(|l| l.index()), Some(3));
+
+        let received = stage_received(&b_sm, &snap);
+        b_sm.install_snapshot(&snap.meta, received).await.unwrap();
+
+        let files = snap_files(dir_b.path());
+        assert_eq!(files.len(), 1, "{files:?}");
+        let current = b_sm.get_current_snapshot().await.unwrap().unwrap();
+        assert_eq!(current.meta, snap.meta);
+    }
+
+    #[tokio::test]
+    async fn restart_loads_latest_snapshot_then_replays() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sm = KvStateMachine::open(dir.path()).await.unwrap();
+        sm.apply(mixed_stream(1..=50)).await.unwrap();
+        // The builder captures start index 50; entries 51..=80 land while it is outstanding, so
+        // the scan observes some of them (fuzzy).
+        let mut builder = sm.try_create_snapshot_builder(false).await.unwrap();
+        sm.apply(mixed_stream(51..=80)).await.unwrap();
+        let snap = builder.build_snapshot().await.unwrap();
+        assert_eq!(snap.meta.last_log_id.as_ref().map(|l| l.index()), Some(50));
+        drop(builder);
+        drop(sm);
+
+        let mut restarted = KvStateMachine::open(dir.path()).await.unwrap();
+        let (applied, _) = RaftStateMachine::applied_state(&mut restarted).await.unwrap();
+        assert_eq!(applied.map(|l| l.index()), Some(50));
+        restarted.apply(mixed_stream(51..=80)).await.unwrap();
+
+        let mut sequential = KvStateMachine::new();
+        sequential.apply(mixed_stream(1..=80)).await.unwrap();
+        for k in 0..7 {
+            let key = format!("k{k}");
+            assert_eq!(
+                restarted.engine().get(key.as_bytes()),
+                sequential.engine().get(key.as_bytes()),
+                "{key} differs"
+            );
+        }
+        assert_eq!(
+            KvStateMachine::applied_state(&restarted).0,
+            KvStateMachine::applied_state(&sequential).0
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_yields_every_256_entries() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let ticks = Arc::new(AtomicU64::new(0));
+        let ticker = {
+            let ticks = Arc::clone(&ticks);
+            tokio::spawn(async move {
+                loop {
+                    ticks.fetch_add(1, Ordering::Relaxed);
+                    tokio::task::yield_now().await;
+                }
+            })
+        };
+        let mut sm = KvStateMachine::new();
+        sm.apply(set_stream(1..=2000)).await.unwrap();
+        ticker.abort();
+        let seen = ticks.load(Ordering::Relaxed);
+        assert!(seen >= 7, "ticker ran only {seen} times during 2000 applies");
+    }
+
+    #[tokio::test]
+    async fn apply_stream_and_build_snapshot_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sm = KvStateMachine::open(dir.path()).await.unwrap();
+        sm.apply(set_stream(1..=10)).await.unwrap();
+
+        let snap = sm.get_snapshot_builder().await.build_snapshot().await.unwrap();
+        assert_eq!(snap.meta.last_log_id.as_ref().map(|l| l.index()), Some(10));
+        assert!(snap.snapshot.path.exists());
+        drop(sm);
+
+        let mut reopened = KvStateMachine::open(dir.path()).await.unwrap();
+        let (applied, _) = RaftStateMachine::applied_state(&mut reopened).await.unwrap();
+        assert_eq!(applied.map(|l| l.index()), Some(10));
+        for i in 1..=10u64 {
+            assert_eq!(
+                reopened.engine().get(format!("key{i}").as_bytes()),
+                Some(b(&format!("val{i}")))
+            );
+        }
     }
 
     #[test]
