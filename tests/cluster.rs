@@ -177,3 +177,184 @@ async fn single_node_snapshot_purge_restart() {
     expect_value(&node, "after", "restart").await;
     node.shutdown().await.unwrap();
 }
+
+// ---------------------------------------------------------------------------------------------
+// Three-node cluster over the fake network (plan 03-14).
+// ---------------------------------------------------------------------------------------------
+
+use common::{set_req, ClusterOpts, TestCluster};
+
+fn expect_map(prefix: &str, range: std::ops::Range<usize>) -> BTreeMap<Vec<u8>, Vec<u8>> {
+    range
+        .map(|i| (format!("{prefix}-{i:03}").into_bytes(), format!("val-{i:03}").into_bytes()))
+        .collect()
+}
+
+async fn write_keys(cluster: &TestCluster, prefix: &str, range: std::ops::Range<usize>) {
+    write_keys_among(cluster, &cluster.live_ids(), prefix, range).await;
+}
+
+async fn write_keys_among(
+    cluster: &TestCluster,
+    ids: &[u64],
+    prefix: &str,
+    range: std::ops::Range<usize>,
+) {
+    for i in range {
+        let resp = cluster
+            .write_among(ids, set_req(&format!("{prefix}-{i:03}"), &format!("val-{i:03}")))
+            .await
+            .expect("write acknowledged");
+        assert_eq!(resp, KvResponse::Ok);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn three_node_election_and_replication() {
+    let cluster = TestCluster::start(3, ClusterOpts::default()).await;
+    let leader = cluster.leader().await;
+    assert!((1..=3).contains(&leader));
+
+    write_keys(&cluster, "k", 0..50).await;
+    cluster.wait_converged(&[1, 2, 3], &expect_map("k", 0..50)).await;
+
+    // Replication and heartbeats travel on separate lanes: both carried traffic.
+    let stats = cluster.ctl.stats();
+    assert!(stats.replication.delivered > 0, "no replication traffic: {stats:?}");
+    assert!(stats.heartbeat.delivered > 0, "no heartbeat traffic: {stats:?}");
+
+    // All three agree on one leader and one term.
+    eventually(WAIT, "all nodes agree on leader and term", || {
+        let ms: Vec<_> = (1..=3).map(|id| cluster.node(id).metrics()).collect();
+        let ok = ms.iter().all(|m| m.current_leader == Some(leader))
+            && ms.iter().all(|m| m.current_term == ms[0].current_term);
+        async move { ok }
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn leader_failover_new_leader_elected() {
+    let mut cluster = TestCluster::start(3, ClusterOpts::default()).await;
+    let old_leader = cluster.leader().await;
+
+    write_keys(&cluster, "a", 0..20).await;
+    let mut expected = expect_map("a", 0..20);
+    cluster.wait_converged(&[1, 2, 3], &expected).await;
+
+    cluster.kill(old_leader).await;
+    let survivors: Vec<u64> = (1..=3).filter(|id| *id != old_leader).collect();
+    let new_leader = cluster.leader_among(&survivors).await;
+    assert_ne!(new_leader, old_leader, "a different node must lead after the kill");
+
+    // Two of three nodes still accept and commit writes.
+    write_keys(&cluster, "b", 0..20).await;
+    expected.extend(expect_map("b", 0..20));
+    cluster.wait_converged(&survivors, &expected).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn partition_heals_and_minority_converges() {
+    let cluster = TestCluster::start(3, ClusterOpts::default()).await;
+    let old_leader = cluster.leader().await;
+    let old_term = cluster.node(old_leader).metrics().current_term;
+
+    write_keys(&cluster, "a", 0..10).await;
+    let mut expected = expect_map("a", 0..10);
+    cluster.wait_converged(&[1, 2, 3], &expected).await;
+
+    cluster.ctl.isolate(old_leader);
+    let majority: Vec<u64> = (1..=3).filter(|id| *id != old_leader).collect();
+    let new_leader = cluster.leader_among(&majority).await;
+    assert_ne!(new_leader, old_leader);
+    assert!(
+        cluster.node(new_leader).metrics().current_term > old_term,
+        "the majority side must elect in a higher term"
+    );
+
+    // The majority keeps committing.
+    write_keys_among(&cluster, &majority, "b", 0..10).await;
+    expected.extend(expect_map("b", 0..10));
+    cluster.wait_converged(&majority, &expected).await;
+
+    // The isolated old leader cannot commit: its write never returns Ok.
+    let res = tokio::time::timeout(
+        Duration::from_secs(2),
+        cluster.node(old_leader).write(set_req("minority-only", "must-not-commit")),
+    )
+    .await;
+    assert!(!matches!(res, Ok(Ok(_))), "isolated leader committed a write: {res:?}");
+
+    // Heal: the old leader steps down, discards its uncommitted entry and converges.
+    cluster.ctl.heal();
+    eventually(Duration::from_secs(15), "old leader steps down behind the new leader", || {
+        let m = cluster.node(old_leader).metrics();
+        async move { m.current_leader.is_some_and(|l| l != old_leader) }
+    })
+    .await;
+    cluster.wait_converged(&[1, 2, 3], &expected).await;
+    assert!(
+        cluster.node(old_leader).engine().get(b"minority-only").is_none(),
+        "the uncommitted write must be absent"
+    );
+}
+
+/// Crash a node with a genuinely torn WAL tail (decision D-16): its fsync is delayed while writes
+/// keep arriving, so a record is half-persisted when power is lost. Restart must discard the torn
+/// bytes by CRC rather than fail, and no acknowledged write may be lost on any node.
+#[tokio::test(flavor = "multi_thread")]
+async fn kill_restart_keeps_committed_writes() {
+    let opts = ClusterOpts { use_fake_io: true, ..ClusterOpts::default() };
+    let mut cluster = TestCluster::start(3, opts).await;
+    cluster.leader().await;
+
+    write_keys(&cluster, "base", 0..100).await;
+    let mut acked = expect_map("base", 0..100);
+    cluster.wait_converged(&[1, 2, 3], &acked).await;
+
+    // Crash 1: a follower, torn after 7 unsynced bytes.
+    let leader = cluster.leader().await;
+    let follower = (1..=3).find(|id| *id != leader).unwrap();
+    let writer = cluster.spawn_writer("bg1");
+    writer.wait_acked(5).await;
+    cluster.crash_with_unsynced_tail(follower, 7).await;
+    let progress = writer.acked();
+    writer.wait_acked(progress + 5).await; // two of three nodes keep committing
+    acked.extend(writer.stop().await);
+
+    cluster.restart(follower).await;
+    let first = cluster.node(follower).recovery_stats();
+    assert!(
+        first.torn_bytes_discarded > 0,
+        "follower restart must have discarded a torn tail, not found a clean log: {first:?}"
+    );
+    cluster.assert_contain_and_identical(&[1, 2, 3], &acked).await;
+
+    // Crash 2: the leader, torn after 301 unsynced bytes, while writes continue through the
+    // survivor that wins the next election.
+    let leader = cluster.leader().await;
+    let writer = cluster.spawn_writer("bg2");
+    writer.wait_acked(5).await;
+    cluster.crash_with_unsynced_tail(leader, 301).await;
+    let survivors: Vec<u64> = (1..=3).filter(|id| *id != leader).collect();
+    let new_leader = cluster.leader_among(&survivors).await;
+    assert_ne!(new_leader, leader);
+    let progress = writer.acked();
+    writer.wait_acked(progress + 5).await;
+    acked.extend(writer.stop().await);
+
+    cluster.restart(leader).await;
+    let second = cluster.node(leader).recovery_stats();
+    let torn_total = first.torn_bytes_discarded + second.torn_bytes_discarded;
+    assert!(
+        torn_total > 0,
+        "torn tails must have been discarded: first {first:?}, second {second:?}"
+    );
+
+    // Every acknowledged write is on all three nodes, and the nodes are identical (a write that
+    // was in flight at a crash and never acknowledged may be present or absent, but the same
+    // everywhere).
+    cluster.leader().await;
+    cluster.assert_contain_and_identical(&[1, 2, 3], &acked).await;
+    eprintln!("torn bytes discarded: follower {first:?}, ex-leader {second:?}");
+}
