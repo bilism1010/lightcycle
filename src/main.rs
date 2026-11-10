@@ -2,7 +2,6 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::Context;
 use clap::{Parser, ValueEnum};
@@ -272,24 +271,24 @@ async fn main() -> anyhow::Result<()> {
         let raft = node.raft().clone();
         let id = config.node_id;
         tokio::spawn(async move {
-            // Report each time this node becomes leader; ends when the Raft core stops.
+            use openraft::async_runtime::watch::WatchReceiver;
+            // Report each real transition to leader: one line per term this node leads, however
+            // long it stays leader. Ends when the Raft core stops (the metrics sender drops).
+            let mut metrics = raft.metrics();
+            let mut announced_term: Option<u64> = None;
             loop {
-                let wait = raft.wait(Some(Duration::from_secs(3600)));
-                match wait.state(ServerState::Leader, "this node becomes leader").await {
-                    Ok(m) => {
-                        println!("[Lightcycle] node {} is leader (term {})", id, m.current_term);
-                        let wait = raft.wait(Some(Duration::from_secs(3600)));
-                        match wait
-                            .metrics(|m| m.state != ServerState::Leader, "leadership lost")
-                            .await
-                        {
-                            Ok(_) => {}
-                            Err(openraft::metrics::WaitError::Timeout(..)) => {}
-                            Err(_) => break,
-                        }
-                    }
-                    Err(openraft::metrics::WaitError::Timeout(..)) => {}
-                    Err(_) => break,
+                let (leader, term) = {
+                    let m = metrics.borrow_and_update();
+                    (m.state == ServerState::Leader, m.current_term)
+                };
+                if !leader {
+                    announced_term = None;
+                } else if announced_term != Some(term) {
+                    println!("[Lightcycle] node {} is leader (term {})", id, term);
+                    announced_term = Some(term);
+                }
+                if metrics.changed().await.is_err() {
+                    break;
                 }
             }
         })
