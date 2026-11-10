@@ -202,6 +202,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let net_cfg = TcpNetConfig::new(config.cluster_id, config.node_id, cfg.recv_dir());
+    net_cfg.validate().map_err(anyhow::Error::msg).context("invalid transport settings")?;
     let node = RaftNode::start(cfg.clone(), TcpNetworkFactory::new(net_cfg.clone()))
         .await
         .context("failed to start the raft node")?;

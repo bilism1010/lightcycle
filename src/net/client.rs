@@ -51,16 +51,24 @@ const PRE_HELLO_FRAME_CAP: usize = 4096;
 const SNAPSHOT_FRAME_SLACK: usize = 64 * 1024;
 
 /// Settings shared by the client factory and the server.
+///
+/// **Cluster-wide settings.** `max_frame_len`, `snapshot_chunk_size` and `snapshot_ack_window`
+/// must be the same on every node: the handshake does not negotiate them, so a mismatch shows
+/// up late and opaquely (a connection closed on a frame over the peer's cap, or a snapshot
+/// transfer that stalls until the idle timeout). Run [`validate`](TcpNetConfig::validate) at
+/// startup; it checks what one node can check about its own values. The remaining fields are
+/// local to a node.
 #[derive(Debug, Clone)]
 pub struct TcpNetConfig {
     /// Cluster this node belongs to; mismatching Hellos are rejected.
     pub cluster_id: u64,
     /// This node's id (announced in the Hello).
     pub node_id: u64,
-    /// Frame cap for the replication and heartbeat lanes (default 32 MiB). Keep it at least
-    /// twice [`REPLICATION_BATCH_BYTES`](crate::wal::store::REPLICATION_BATCH_BYTES), the byte
-    /// budget of one AppendEntries batch; a smaller cap can refuse a batch of large entries and
-    /// stall replication to that peer.
+    /// Frame cap for the replication and heartbeat lanes (default 32 MiB; cluster-wide). It must
+    /// hold one AppendEntries batch, whose byte budget is
+    /// [`REPLICATION_BATCH_BYTES`](crate::wal::store::REPLICATION_BATCH_BYTES);
+    /// [`validate`](TcpNetConfig::validate) refuses a smaller cap, which would stall replication
+    /// to a lagging peer.
     pub max_frame_len: usize,
     /// Time allowed for the Hello exchange (default 5 s).
     pub handshake_timeout: Duration,
@@ -70,10 +78,10 @@ pub struct TcpNetConfig {
     pub inflight_requests: usize,
     /// Maximum request body bytes in flight on one pipelined connection (default 8 MiB).
     pub inflight_bytes: usize,
-    /// Snapshot chunk size (default 1 MiB). It also sets the snapshot lane's frame cap, so a
+    /// Snapshot chunk size (default 1 MiB; cluster-wide). It also sets the snapshot lane's frame cap, so a
     /// sender never uses a chunk larger than this even if openraft recommends one.
     pub snapshot_chunk_size: usize,
-    /// Snapshot chunks per acknowledgement (default 4): the receiver acknowledges every this many
+    /// Snapshot chunks per acknowledgement (default 4; cluster-wide): the receiver acknowledges every this many
     /// chunks and the sender never has more than this many unacknowledged. Both ends must use
     /// the same value (a sender window smaller than the receiver's stalls until the idle
     /// timeout).
@@ -110,6 +118,31 @@ pub struct TcpNetConfig {
 }
 
 impl TcpNetConfig {
+    /// Check the values that must be usable together on this node.
+    ///
+    /// `max_frame_len` has to hold a full AppendEntries batch, which the log store bounds by
+    /// [`REPLICATION_BATCH_BYTES`](crate::wal::store::REPLICATION_BATCH_BYTES) (or one entry of
+    /// up to the 16 MiB record limit when that is larger); a smaller cap would wedge replication
+    /// to a lagging peer permanently. Matching the peers' values cannot be checked here.
+    pub fn validate(&self) -> Result<(), String> {
+        let batch = crate::wal::store::REPLICATION_BATCH_BYTES
+            .max(crate::wal::record::MAX_RECORD_LEN as usize);
+        if self.max_frame_len < batch + 64 * 1024 {
+            return Err(format!(
+                "max_frame_len {} is below the {} bytes needed to carry one replication batch",
+                self.max_frame_len,
+                batch + 64 * 1024
+            ));
+        }
+        if self.snapshot_chunk_size == 0 {
+            return Err("snapshot_chunk_size must be non-zero".to_string());
+        }
+        if self.snapshot_ack_window == 0 {
+            return Err("snapshot_ack_window must be non-zero".to_string());
+        }
+        Ok(())
+    }
+
     /// A config with the documented defaults.
     pub fn new(cluster_id: u64, node_id: u64, recv_dir: PathBuf) -> Self {
         TcpNetConfig {
@@ -870,6 +903,21 @@ mod tests {
         // A batch is at most the budget, or one entry (under 16 MiB) when that is larger.
         let worst = crate::wal::store::REPLICATION_BATCH_BYTES.max(16 * 1024 * 1024);
         assert!(cfg.max_frame_len >= 2 * worst, "{} vs {worst}", cfg.max_frame_len);
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn validate_refuses_a_frame_cap_below_one_batch_and_zero_sizes() {
+        let ok = TcpNetConfig::new(1, 1, PathBuf::new());
+        let mut small_cap = ok.clone();
+        small_cap.max_frame_len = 8 * 1024 * 1024;
+        assert!(small_cap.validate().unwrap_err().contains("max_frame_len"));
+        let mut no_chunk = ok.clone();
+        no_chunk.snapshot_chunk_size = 0;
+        assert!(no_chunk.validate().is_err());
+        let mut no_window = ok;
+        no_window.snapshot_ack_window = 0;
+        assert!(no_window.validate().is_err());
     }
 
     #[tokio::test]
