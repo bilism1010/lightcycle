@@ -13,6 +13,7 @@
 
 [![Rust](https://img.shields.io/badge/RUST-1.75%2B-00e5ff?style=for-the-badge&logo=rust&logoColor=white&labelColor=03060f)](https://www.rust-lang.org/)
 [![Status](https://img.shields.io/badge/STATUS-ACTIVE%20RESEARCH-18a0ff?style=for-the-badge&labelColor=03060f)](https://github.com/bsommers)
+[![License](https://img.shields.io/badge/LICENSE-MIT%20OR%20APACHE--2.0-00e5ff?style=for-the-badge&labelColor=03060f)](#-license)
 [![Latency](https://img.shields.io/badge/TAIL%20LATENCY-P99%20%3C%20150%C2%B5s-00e5ff?style=for-the-badge&labelColor=03060f)](#performance-targets)
 [![Replication](https://img.shields.io/badge/CONSENSUS-RAFT%20PIPELINED-00e5ff?style=for-the-badge&labelColor=03060f)](#the-solution)
 
@@ -119,6 +120,20 @@ cargo run -- --node-id 1 --bind 127.0.0.1:7441 --peers "2=127.0.0.1:7442,3=127.0
 cargo run -- --node-id 2 --bind 127.0.0.1:7442 --peers "1=127.0.0.1:7441,3=127.0.0.1:7443" &
 cargo run -- --node-id 3 --bind 127.0.0.1:7443 --peers "1=127.0.0.1:7441,2=127.0.0.1:7442"
 ```
+
+---
+
+## 📄 License & Commercial Terms
+
+Project Lightcycle is dual-licensed under either:
+
+* **Apache License, Version 2.0** ([`LICENSE-APACHE`](LICENSE-APACHE) or [http://www.apache.org/licenses/LICENSE-2.0](http://www.apache.org/licenses/LICENSE-2.0))
+* **MIT License** ([`LICENSE-MIT`](LICENSE-MIT) or [http://opensource.org/licenses/MIT](http://opensource.org/licenses/MIT))
+
+at your option.
+
+### Commercial & Enterprise Inquiries
+As the creator and copyright holder, Bill Sommers retains ownership of the codebase. Enterprise extensions, bespoke integration, commercial distribution rights, and managed hosting solutions are available under customized commercial licensing agreements. For inquiries, contact the author.
 
 ---
 

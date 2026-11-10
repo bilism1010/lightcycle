@@ -2,8 +2,10 @@
 name = "lightcycle"
 version = "0.1.0"
 edition = "2021"
+authors = ["Bill Sommers"]
 description = "Sub-millisecond in-memory cache engine with Raft-based consensus replication and custom lock-free memory buffers"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/bilism1010/lightcycle"
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
