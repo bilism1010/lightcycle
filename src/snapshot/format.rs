@@ -66,8 +66,12 @@ pub enum SnapshotError {
     /// The header does not start with the snapshot magic.
     #[error("bad snapshot magic")]
     BadMagic,
-    /// The header names a format version this build cannot read.
-    #[error("unsupported snapshot format version {0}")]
+    /// The header names a format version this build cannot read. The file may be perfectly
+    /// healthy (for example written by a newer build before a downgrade): do not wipe the node.
+    #[error(
+        "snapshot format version {0} is not supported by this build (a newer build may have \
+         written it): run a build that supports it instead of wiping the node"
+    )]
     UnsupportedVersion(u16),
     /// The file ended before the footer was complete.
     #[error("snapshot truncated")]

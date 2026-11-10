@@ -62,6 +62,16 @@ fn snapshot_io_error(e: SnapshotError) -> io::Error {
     }
 }
 
+/// A snapshot body that fails validation is the same unrecoverable condition as a corrupt
+/// header, and gets the same operator guidance. I/O errors and an unsupported format version stay
+/// as they are: neither says the file is damaged.
+fn body_corruption(e: SnapshotError) -> SnapshotError {
+    match e {
+        SnapshotError::Io(_) | SnapshotError::UnsupportedVersion(_) => e,
+        _ => SnapshotError::CorruptNeedsWipe,
+    }
+}
+
 fn join_error(e: tokio::task::JoinError) -> io::Error {
     io::Error::other(format!("blocking snapshot task failed: {e}"))
 }
@@ -141,7 +151,7 @@ impl KvStateMachine {
         let (store, restored) = tokio::task::spawn_blocking(move || {
             let store = SnapshotStore::open(dir)?;
             let restored = match store.latest()? {
-                Some((_, file)) => Some(load_snapshot(&file.path)?),
+                Some((_, file)) => Some(load_snapshot(&file.path).map_err(body_corruption)?),
                 None => None,
             };
             Ok::<_, SnapshotError>((store, restored))
@@ -472,6 +482,19 @@ mod tests {
         // A reader holding the old Arc still sees the old data.
         assert_eq!(old_engine.get(b"k1"), Some(b("v1")));
         assert_eq!(old_engine.get(b"key1"), None);
+    }
+
+    #[tokio::test]
+    async fn open_reports_wipe_guidance_for_a_corrupt_snapshot_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_sm, snap) = machine_with_snapshot(dir.path(), 1..=50).await;
+        let mut bytes = std::fs::read(&snap.snapshot.path).unwrap();
+        let mid = bytes.len() / 2;
+        bytes[mid] ^= 0xFF;
+        std::fs::write(&snap.snapshot.path, &bytes).unwrap();
+
+        let err = KvStateMachine::open(dir.path()).await.err().expect("corrupt body must fail");
+        assert!(err.to_string().contains("wipe"), "{err}");
     }
 
     #[tokio::test]

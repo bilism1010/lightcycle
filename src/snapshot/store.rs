@@ -193,6 +193,9 @@ impl SnapshotStore {
         let meta = match read_header(&path) {
             Ok(m) => m,
             Err(SnapshotError::Io(e)) => return Err(SnapshotError::Io(e)),
+            // A healthy file from another format version is not corruption: wiping the node
+            // would destroy good state where a different build would have worked.
+            Err(e @ SnapshotError::UnsupportedVersion(_)) => return Err(e),
             Err(_) => return Err(SnapshotError::CorruptNeedsWipe),
         };
         if key_of(&meta) != (index, term) {
@@ -471,6 +474,20 @@ mod tests {
         // Truncated to nothing is just as fatal, and the older file is never used instead.
         fs::write(&newest, b"").unwrap();
         assert!(matches!(store.latest(), Err(SnapshotError::CorruptNeedsWipe)));
+    }
+
+    #[test]
+    fn unsupported_version_is_not_reported_as_corruption() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SnapshotStore::open(dir.path()).unwrap();
+        let f = store.build(&engine(5), &meta(5, 1)).unwrap();
+        // The version is checked before the header CRC; the header body follows the 4-byte
+        // length prefix and the frame header, and holds magic (6 bytes) then the version.
+        let mut bytes = fs::read(&f.path).unwrap();
+        let version_at = 4 + crate::wire::frame::HEADER_LEN + 6;
+        bytes[version_at..version_at + 2].copy_from_slice(&u16::MAX.to_be_bytes());
+        fs::write(&f.path, &bytes).unwrap();
+        assert!(matches!(store.latest(), Err(SnapshotError::UnsupportedVersion(v)) if v == u16::MAX));
     }
 
     #[test]
