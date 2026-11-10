@@ -113,6 +113,9 @@ impl RaftHandler for DeferredHandler {
         file: &SnapshotFile,
     ) -> BoxFuture<'static, Result<(), String>> {
         match self.inner.get() {
+            // The same startup race `install_snapshot` guards against: a receive file deleted by
+            // the node's own recv-dir cleanup is answered there with the retryable "stopped".
+            Some(_) if !file.path.exists() => Box::pin(async { Ok(()) }),
             Some(h) => h.validate_snapshot(meta, file),
             // Not started: let `install_snapshot` answer with its retryable "stopped" failure.
             None => Box::pin(async { Ok(()) }),
