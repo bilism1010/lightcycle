@@ -72,9 +72,16 @@ fn record_crc(len_bytes: &[u8; 4], ty: u8, payload: &[u8]) -> u32 {
 
 /// Appends one framed record to `out` and returns the number of bytes appended.
 ///
-/// The caller is responsible for keeping the payload within [`MAX_RECORD_LEN`]; the writer rejects
-/// oversize records with `WalError::RecordTooLarge` before framing.
+/// The caller is responsible for keeping the payload within [`MAX_RECORD_LEN`] (the type byte
+/// counts toward it): `WalLogStore::append` rejects oversize entries with an `InvalidInput` error
+/// before they reach the writer, and the writer fail-stops on an unacknowledged record that
+/// still does not fit. Debug builds assert it.
 pub fn encode_record(out: &mut Vec<u8>, ty: RecordType, payload: &[u8]) -> usize {
+    debug_assert!(
+        1 + payload.len() <= MAX_RECORD_LEN as usize,
+        "record of {} bytes exceeds MAX_RECORD_LEN",
+        1 + payload.len()
+    );
     let len = (1 + payload.len()) as u32;
     let len_bytes = len.to_le_bytes();
     let crc = record_crc(&len_bytes, ty as u8, payload);

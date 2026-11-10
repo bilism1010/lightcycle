@@ -220,18 +220,6 @@ pub enum WalError {
         /// What was wrong.
         reason: String,
     },
-    /// The writer hit a fatal error earlier and refuses further work.
-    #[error("wal writer has failed")]
-    Failed,
-    /// The writer has shut down.
-    #[error("wal is closed")]
-    Closed,
-    /// A single record exceeds the maximum record length.
-    #[error("record of {len} bytes exceeds the maximum record length")]
-    RecordTooLarge {
-        /// Offending length in bytes.
-        len: usize,
-    },
     /// Invalid configuration.
     #[error("invalid wal config: {0}")]
     Config(String),
