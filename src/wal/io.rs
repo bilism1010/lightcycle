@@ -16,6 +16,8 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
+use super::segment::{parse_segment_name, segment_file_name};
+
 /// Positional read access to segments, shareable across threads (used by the entry cache and the
 /// log reader so reads never go through the writer thread).
 pub trait SegmentRead: Send + Sync {
@@ -47,19 +49,6 @@ pub trait SegmentIo: Send + 'static {
     fn reader(&self) -> Arc<dyn SegmentRead>;
 }
 
-// Private numeric-only name helpers for Task 1; replaced by the shared ones in `segment.rs`.
-fn file_name(seq: u64) -> String {
-    format!("{seq:016x}.wal")
-}
-
-fn parse_name(name: &str) -> Option<u64> {
-    let stem = name.strip_suffix(".wal")?;
-    if stem.len() != 16 || !stem.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
-        return None;
-    }
-    u64::from_str_radix(stem, 16).ok()
-}
-
 /// Open-handle cache shared between the writer-side backend and its readers.
 struct Handles {
     dir: PathBuf,
@@ -68,7 +57,7 @@ struct Handles {
 
 impl Handles {
     fn path(&self, seq: u64) -> PathBuf {
-        self.dir.join(file_name(seq))
+        self.dir.join(segment_file_name(seq))
     }
 
     fn get(&self, seq: u64) -> io::Result<Arc<File>> {
@@ -130,7 +119,7 @@ impl SegmentIo for StdFsIo {
         let mut seqs = Vec::new();
         for entry in std::fs::read_dir(&self.handles.dir)? {
             let entry = entry?;
-            if let Some(seq) = entry.file_name().to_str().and_then(parse_name) {
+            if let Some(seq) = entry.file_name().to_str().and_then(parse_segment_name) {
                 seqs.push(seq);
             }
         }
@@ -583,7 +572,7 @@ mod tests {
         assert_eq!(std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
 
         io.create_segment(1, 4096).unwrap();
-        let file_mode = std::fs::metadata(dir.join(file_name(1))).unwrap().permissions().mode();
+        let file_mode = std::fs::metadata(dir.join(segment_file_name(1))).unwrap().permissions().mode();
         assert_eq!(file_mode & 0o777, 0o600);
         assert_eq!(io.len(1).unwrap(), 4096);
 

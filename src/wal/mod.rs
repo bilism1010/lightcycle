@@ -3,5 +3,15 @@
 //! Invariants: appends are durable only after the group-commit fsync completes; each flush
 //! callback is completed exactly once; mid-log corruption is never treated as a torn tail.
 
+pub mod cache;
 pub mod io;
 pub mod record;
+pub mod recovery;
+pub mod segment;
+pub mod store;
+pub mod writer;
+
+pub use segment::{
+    EntryLocation, Fsync, NoopObserver, Preamble, PreambleState, SegmentSummary, WalConfig,
+    WalError, WalObserver, WalStart,
+};
