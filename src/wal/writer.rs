@@ -813,7 +813,7 @@ impl<P: WalPayload> Drop for WalHandle<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wal::io::{FakeIo, StdFsIo};
+    use crate::wal::io::{FakeIo, IoEvent, StdFsIo};
     use crate::wal::record::{decode_record, Decoded};
     use crate::wal::segment::{decode_preamble, NoopObserver};
     use std::sync::mpsc::{channel, Receiver};
@@ -821,6 +821,8 @@ mod tests {
     struct Rec {
         ty: RecordType,
         payload: Vec<u8>,
+        offset: usize,
+        len: usize,
     }
 
     /// Walks a segment image; the flag is true when the walk ended on unwritten space.
@@ -830,7 +832,12 @@ mod tests {
         loop {
             match decode_record(&bytes[off..]) {
                 Decoded::Record { ty, payload, consumed } => {
-                    recs.push(Rec { ty, payload: payload.to_vec() });
+                    recs.push(Rec {
+                        ty,
+                        payload: payload.to_vec(),
+                        offset: off,
+                        len: consumed,
+                    });
                     off += consumed;
                 }
                 Decoded::End => return (recs, true),
@@ -863,15 +870,57 @@ mod tests {
     }
 
     fn spawn_fake(config: WalConfig) -> (WalHandle<Vec<u8>>, FakeIo) {
+        spawn_fake_with(config, Box::new(NoopObserver))
+    }
+
+    fn spawn_fake_with(
+        config: WalConfig,
+        observer: Box<dyn WalObserver>,
+    ) -> (WalHandle<Vec<u8>>, FakeIo) {
         let io = FakeIo::new();
-        let handle = WalHandle::spawn(
-            Box::new(io.clone()),
-            config,
-            WalStart::fresh(),
-            Box::new(NoopObserver),
-        )
-        .unwrap();
+        let handle =
+            WalHandle::spawn(Box::new(io.clone()), config, WalStart::fresh(), observer).unwrap();
         (handle, io)
+    }
+
+    fn body(index: u64, len: usize) -> Vec<u8> {
+        vec![(index % 251) as u8; len]
+    }
+
+    /// Submits entries `lo..=hi` of `len` body bytes and waits for the last ack.
+    fn fill(h: &mut WalHandle<Vec<u8>>, lo: u64, hi: u64, len: usize) {
+        let mut last = None;
+        for i in lo..=hi {
+            let ack = if i == hi {
+                let (a, rx) = ack_chan();
+                last = Some(rx);
+                Some(a)
+            } else {
+                None
+            };
+            submit(h, WalOp::Entry { index: i, payload: body(i, len), ack });
+        }
+        wait(&last.unwrap()).unwrap();
+    }
+
+    /// Submits one op built from an ack and waits for its completion.
+    fn op_wait(
+        h: &mut WalHandle<Vec<u8>>,
+        make: impl FnOnce(Option<Ack>) -> WalOp<Vec<u8>>,
+    ) -> io::Result<()> {
+        let (ack, rx) = ack_chan();
+        submit(h, make(Some(ack)));
+        wait(&rx)
+    }
+
+    /// Entry indexes physically present in a segment image, in order.
+    fn seg_entries(bytes: &[u8]) -> Vec<u64> {
+        walk(bytes)
+            .0
+            .iter()
+            .filter(|r| r.ty == RecordType::Entry)
+            .map(entry_index)
+            .collect()
     }
 
     fn submit<P: WalPayload>(h: &mut WalHandle<P>, mut op: WalOp<P>) {
@@ -937,5 +986,316 @@ mod tests {
         assert_eq!(recs[1].ty, RecordType::Entry);
         assert_eq!(entry_index(&recs[1]), 1);
         assert_eq!(&recs[1].payload[8..], b"durable");
+    }
+
+    // ---- Task 2: rolling, markers, purge and durability ordering ----
+
+    fn state_of(rec: &Rec) -> PreambleState {
+        assert_eq!(rec.ty, RecordType::Preamble);
+        decode_preamble(&rec.payload).unwrap().state
+    }
+
+    #[test]
+    fn roll_emits_preamble_with_current_vote_purged_committed() {
+        let (mut h, io) = spawn_fake(cfg(4096));
+        op_wait(&mut h, |ack| WalOp::Vote { blob: b"vote-1".to_vec(), ack }).unwrap();
+        op_wait(&mut h, |ack| WalOp::Committed { blob: b"commit-1".to_vec(), ack }).unwrap();
+        op_wait(&mut h, |ack| WalOp::Purge { upto: 0, blob: b"purged-0".to_vec(), ack }).unwrap();
+        fill(&mut h, 1, 120, 100);
+        h.shutdown();
+
+        let segs = segments(&io);
+        assert!(segs.len() >= 4, "expected at least three rolls, got {segs:?}");
+        let want = PreambleState {
+            purged: Some((0, b"purged-0".to_vec())),
+            vote: Some(b"vote-1".to_vec()),
+            committed: Some(b"commit-1".to_vec()),
+        };
+        for seq in &segs[1..] {
+            let (recs, _) = walk(&io.segment_bytes(*seq));
+            assert_eq!(state_of(&recs[0]), want, "segment {seq} preamble");
+        }
+    }
+
+    #[test]
+    fn records_never_span_segments() {
+        let (mut h, io) = spawn_fake(cfg(4096));
+        fill(&mut h, 1, 200, 100);
+        h.shutdown();
+
+        let mut all = Vec::new();
+        let segs = segments(&io);
+        assert!(segs.len() > 1);
+        for seq in segs {
+            let (recs, clean) = walk(&io.segment_bytes(seq));
+            assert!(clean, "segment {seq} must end on unwritten space, not a torn record");
+            assert_eq!(recs[0].ty, RecordType::Preamble);
+            all.extend(recs.iter().filter(|r| r.ty == RecordType::Entry).map(entry_index));
+        }
+        assert_eq!(all, (1..=200).collect::<Vec<u64>>());
+    }
+
+    #[test]
+    fn truncate_is_a_marker_not_an_in_place_edit() {
+        let (mut h, io) = spawn_fake(cfg(1 << 16));
+        fill(&mut h, 1, 5, 40);
+        let before = io.segment_bytes(1);
+        let used: usize = walk(&before).0.iter().map(|r| r.len).sum();
+
+        op_wait(&mut h, |ack| WalOp::TruncateAfter { keep_through: Some(2), ack }).unwrap();
+        let (ack, rx) = ack_chan();
+        submit(&mut h, WalOp::Entry { index: 3, payload: body(99, 41), ack: Some(ack) });
+        wait(&rx).unwrap();
+        h.shutdown();
+
+        let after = io.segment_bytes(1);
+        assert_eq!(&after[..used], &before[..used], "existing bytes must never change");
+        let (recs, clean) = walk(&after);
+        assert!(clean);
+        let types: Vec<RecordType> = recs.iter().map(|r| r.ty).collect();
+        let mut want = vec![RecordType::Preamble];
+        want.extend([RecordType::Entry; 5]);
+        want.extend([RecordType::TruncateAfter, RecordType::Entry]);
+        assert_eq!(types, want);
+        assert_eq!(recs[6].payload, [vec![1u8], 2u64.to_le_bytes().to_vec()].concat());
+        assert_eq!(entry_index(&recs[7]), 3);
+        assert_eq!(&recs[7].payload[8..], &body(99, 41)[..]);
+    }
+
+    #[test]
+    fn purge_deletes_only_old_non_active_segments() {
+        let (mut h, io) = spawn_fake(cfg(4096));
+        fill(&mut h, 1, 150, 100);
+        let segs = segments(&io);
+        assert!(segs.len() >= 4, "{segs:?}");
+        let upto = *seg_entries(&io.segment_bytes(segs[1])).last().unwrap();
+
+        let dir_syncs = io.stats().dir_syncs;
+        op_wait(&mut h, |ack| WalOp::Purge { upto, blob: b"p".to_vec(), ack }).unwrap();
+        assert_eq!(segments(&io), segs[2..].to_vec());
+        assert!(io.stats().dir_syncs > dir_syncs, "deletions must be dir-synced");
+
+        // Purging past every entry still never deletes the active segment.
+        op_wait(&mut h, |ack| WalOp::Purge { upto: u64::MAX, blob: b"q".to_vec(), ack }).unwrap();
+        h.shutdown();
+        let after = segments(&io);
+        assert_eq!(after.len(), 1, "{after:?}");
+        assert!(after[0] >= *segs.last().unwrap());
+    }
+
+    #[derive(Debug, Clone, PartialEq)]
+    enum Ev {
+        Written(Vec<u64>),
+        Truncate(Option<u64>),
+        Purge(u64),
+        Flushed(u64),
+    }
+
+    struct RecObs(Arc<parking_lot::Mutex<Vec<Ev>>>);
+
+    impl WalObserver for RecObs {
+        fn on_entries_written(&mut self, locs: &[EntryLocation]) {
+            self.0.lock().push(Ev::Written(locs.iter().map(|l| l.index).collect()));
+        }
+        fn on_truncate(&mut self, keep_through: Option<u64>) {
+            self.0.lock().push(Ev::Truncate(keep_through));
+        }
+        fn on_purge(&mut self, upto: u64) {
+            self.0.lock().push(Ev::Purge(upto));
+        }
+        fn on_flushed(&mut self, upto_index: u64) {
+            self.0.lock().push(Ev::Flushed(upto_index));
+        }
+    }
+
+    fn entry_op(index: u64, ack: Option<Ack>) -> WalOp<Vec<u8>> {
+        WalOp::Entry { index, payload: body(index, 8), ack }
+    }
+
+    #[test]
+    fn observer_callbacks_arrive_in_op_order() {
+        // Sequential: every interleaving is deterministic.
+        let log = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let (mut h, _io) = spawn_fake_with(cfg(1 << 16), Box::new(RecObs(Arc::clone(&log))));
+        op_wait(&mut h, |ack| entry_op(1, ack)).unwrap();
+        op_wait(&mut h, |ack| entry_op(2, ack)).unwrap();
+        op_wait(&mut h, |ack| WalOp::TruncateAfter { keep_through: Some(1), ack }).unwrap();
+        op_wait(&mut h, |ack| entry_op(2, ack)).unwrap();
+        op_wait(&mut h, |ack| WalOp::Purge { upto: 1, blob: vec![], ack }).unwrap();
+        h.shutdown();
+        assert_eq!(
+            *log.lock(),
+            vec![
+                Ev::Written(vec![1]),
+                Ev::Flushed(1),
+                Ev::Written(vec![2]),
+                Ev::Flushed(2),
+                Ev::Truncate(Some(1)),
+                Ev::Written(vec![2]),
+                Ev::Flushed(2),
+                Ev::Purge(1),
+            ]
+        );
+
+        // Back to back: batching is arbitrary, but written/truncate/purge keep op order.
+        let log = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let (mut h, _io) = spawn_fake_with(cfg(1 << 16), Box::new(RecObs(Arc::clone(&log))));
+        submit(&mut h, entry_op(1, None));
+        submit(&mut h, entry_op(2, None));
+        submit(&mut h, WalOp::TruncateAfter { keep_through: Some(1), ack: None });
+        submit(&mut h, entry_op(2, None));
+        let (ack, rx) = ack_chan();
+        submit(&mut h, WalOp::Purge { upto: 1, blob: vec![], ack: Some(ack) });
+        wait(&rx).unwrap();
+        h.shutdown();
+        let mut merged: Vec<Ev> = Vec::new();
+        for ev in log.lock().iter().filter(|e| !matches!(e, Ev::Flushed(_))) {
+            match (merged.last_mut(), ev) {
+                (Some(Ev::Written(prev)), Ev::Written(more)) => prev.extend(more),
+                _ => merged.push(ev.clone()),
+            }
+        }
+        assert_eq!(
+            merged,
+            vec![
+                Ev::Written(vec![1, 2]),
+                Ev::Truncate(Some(1)),
+                Ev::Written(vec![2]),
+                Ev::Purge(1),
+            ]
+        );
+    }
+
+    #[test]
+    fn oversize_record_fails_only_its_ack() {
+        let (mut h, io) = spawn_fake(cfg(4096));
+        // First op on a fresh log: rejected without creating a segment.
+        let err = op_wait(&mut h, |ack| WalOp::Entry { index: 1, payload: vec![7; 5000], ack })
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(!h.is_failed());
+        assert!(segments(&io).is_empty());
+
+        fill(&mut h, 1, 2, 100);
+        let err = op_wait(&mut h, |ack| WalOp::Entry { index: 3, payload: vec![7; 5000], ack })
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(!h.is_failed());
+        fill(&mut h, 3, 3, 100);
+        h.shutdown();
+        assert_eq!(seg_entries(&io.segment_bytes(1)), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn rolled_segment_acked_entry_survives_power_loss() {
+        let (mut h, io) = spawn_fake(cfg(4096));
+        op_wait(&mut h, |ack| WalOp::Vote { blob: b"the-vote".to_vec(), ack }).unwrap();
+        fill(&mut h, 1, 100, 100);
+        h.shutdown();
+        io.power_loss(0);
+
+        let segs = segments(&io);
+        assert!(segs.len() >= 3, "{segs:?}");
+        let newest = *segs.last().unwrap();
+        let (recs, _) = walk(&io.segment_bytes(newest));
+        assert_eq!(state_of(&recs[0]).vote, Some(b"the-vote".to_vec()));
+        assert!(
+            recs.iter().any(|r| r.ty == RecordType::Entry && entry_index(r) == 100),
+            "the acked entry must be in the newest durable segment"
+        );
+    }
+
+    #[test]
+    fn every_segment_create_is_dir_synced_before_its_first_sync() {
+        let (mut h, io) = spawn_fake(cfg(4096));
+        io.record_events(true);
+        op_wait(&mut h, |ack| WalOp::Vote { blob: b"v".to_vec(), ack }).unwrap();
+        fill(&mut h, 1, 100, 100);
+        h.shutdown();
+
+        let events = io.events();
+        let mut creates = 0;
+        for (i, ev) in events.iter().enumerate() {
+            let IoEvent::Create { seq } = ev else { continue };
+            creates += 1;
+            let sync = events[i..]
+                .iter()
+                .position(|e| *e == IoEvent::SyncSegment { seq: *seq })
+                .map(|p| p + i)
+                .unwrap_or_else(|| panic!("segment {seq} was never synced"));
+            assert!(
+                events[i..sync].contains(&IoEvent::SyncDir),
+                "segment {seq}: no SyncDir between its Create and its first SyncSegment"
+            );
+        }
+        assert!(creates >= 3);
+    }
+
+    /// The index of the first event after `from` matching `pred`.
+    fn next_event(events: &[IoEvent], from: usize, pred: impl Fn(&IoEvent) -> bool) -> usize {
+        events[from..].iter().position(pred).map(|p| p + from).expect("event not found")
+    }
+
+    #[test]
+    fn purge_marker_durable_before_any_deletion() {
+        let (mut h, io) = spawn_fake(cfg(4096));
+        io.record_events(true);
+        fill(&mut h, 1, 150, 100);
+        let segs = segments(&io);
+        let upto = *seg_entries(&io.segment_bytes(segs[2])).last().unwrap();
+        io.clear_events();
+        op_wait(&mut h, |ack| WalOp::Purge { upto, blob: b"marker".to_vec(), ack }).unwrap();
+        h.shutdown();
+
+        let active = *segments(&io).last().unwrap();
+        let (recs, _) = walk(&io.segment_bytes(active));
+        let marker = recs.iter().find(|r| r.ty == RecordType::Purge).expect("purge marker");
+        let events = io.events();
+        let write = next_event(&events, 0, |e| {
+            matches!(e, IoEvent::Write { seq, offset, len }
+                if *seq == active && (*offset as usize) <= marker.offset
+                    && marker.offset < *offset as usize + *len)
+        });
+        let sync = next_event(&events, write, |e| *e == IoEvent::SyncSegment { seq: active });
+        let first_delete = next_event(&events, 0, |e| matches!(e, IoEvent::Delete { .. }));
+        let last_delete = events.iter().rposition(|e| matches!(e, IoEvent::Delete { .. })).unwrap();
+        assert!(write < sync, "marker write must precede its sync");
+        assert!(sync < first_delete, "marker must be durable before the first deletion");
+        assert!(
+            events[last_delete..].contains(&IoEvent::SyncDir),
+            "a SyncDir must follow the last deletion"
+        );
+    }
+
+    #[test]
+    fn crash_between_purge_marker_and_deletions_keeps_marker_durable() {
+        for n in 1..=3 {
+            let (mut h, io) = spawn_fake(cfg(4096));
+            fill(&mut h, 1, 200, 100);
+            let segs = segments(&io);
+            assert!(segs.len() >= 5, "{segs:?}");
+            let upto = *seg_entries(&io.segment_bytes(segs[2])).last().unwrap();
+
+            io.crash_before_nth_delete(n);
+            let err = op_wait(&mut h, |ack| WalOp::Purge { upto, blob: b"keep-me".to_vec(), ack })
+                .unwrap_err();
+            let _ = err;
+            assert!(h.is_failed());
+            h.shutdown();
+            io.power_loss(0);
+
+            let after = segments(&io);
+            for seq in &segs {
+                assert!(after.contains(seq), "n={n}: segment {seq} lost (listed {after:?})");
+            }
+            let active = *after.last().unwrap();
+            let (recs, _) = walk(&io.segment_bytes(active));
+            let marker = recs
+                .iter()
+                .find(|r| r.ty == RecordType::Purge)
+                .unwrap_or_else(|| panic!("n={n}: purge marker is not durable"));
+            assert_eq!(&marker.payload[..8], &upto.to_le_bytes());
+            assert_eq!(&marker.payload[8..], b"keep-me");
+        }
     }
 }
