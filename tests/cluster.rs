@@ -326,12 +326,6 @@ async fn partition_heals_and_minority_converges() {
     expected.extend(expect_map("b", 0..10));
     cluster.wait_converged(&majority, &expected).await;
 
-    // The isolated old leader cannot commit the entry it appended: the write never returns Ok.
-    if isolated_write.is_finished() {
-        let outcome = isolated_write.await.expect("write task");
-        assert!(outcome.is_err(), "isolated leader committed a write: {outcome:?}");
-    }
-
     // Heal: the old leader steps down, discards its uncommitted entry and converges.
     cluster.ctl.heal();
     eventually(Duration::from_secs(15), "old leader steps down behind the new leader", || {
@@ -351,6 +345,15 @@ async fn partition_heals_and_minority_converges() {
         async move { old == lead }
     })
     .await;
+
+    // The isolated write must never have returned Ok. Either it already failed (its entry was
+    // discarded) or the call is still pending, in which case it is cancelled here. Either way the
+    // outcome is checked unconditionally; abort() on a finished task leaves its result in place.
+    isolated_write.abort();
+    match isolated_write.await {
+        Ok(outcome) => assert!(outcome.is_err(), "isolated leader committed a write: {outcome:?}"),
+        Err(join) => assert!(join.is_cancelled(), "the isolated write task failed: {join:?}"),
+    }
 }
 
 /// Crash a node with a genuinely torn WAL tail (decision D-16): its fsync is delayed while writes

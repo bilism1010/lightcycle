@@ -941,3 +941,46 @@ async fn run_snapshot_lane(
     }
     // `recv`, if still set, drops here and removes its file.
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+
+    /// A peer that completes the connection but never reads must not park the writer forever:
+    /// each frame has `write_timeout` to be accepted by the socket, after which the connection
+    /// is cancelled. Dropping the `write_timeout` branch would leave this test waiting on a
+    /// stuck write until its own deadline.
+    #[tokio::test]
+    async fn writer_task_gives_up_on_a_peer_that_stopped_reading() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stream = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        // Held open and never read from, so the socket buffers fill and stay full.
+        let (_silent_peer, _) = listener.accept().await.unwrap();
+
+        let framed = Framed::new(stream, FrameCodec::new(64 * 1024 * 1024));
+        let (sink, _stream) = framed.split();
+        let (tx, rx) = mpsc::channel::<Frame>(8);
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(writer_task(
+            sink,
+            rx,
+            cancel.clone(),
+            Duration::from_millis(200),
+        ));
+
+        // Far more than loopback socket buffers hold, so the first or second send must stall.
+        let body = Bytes::from(vec![0u8; 16 * 1024 * 1024]);
+        for req_id in 0..4 {
+            let _ = tx.send(Frame::new(1, Lane::Replication, req_id, body.clone())).await;
+        }
+
+        tokio::time::timeout(Duration::from_secs(5), cancel.cancelled())
+            .await
+            .expect("the writer cancelled the connection once a send exceeded write_timeout");
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the writer task ended")
+            .unwrap();
+    }
+}

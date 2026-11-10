@@ -1975,10 +1975,14 @@ async fn snapshot_does_not_starve_heartbeat() {
         install_delay: Duration::from_millis(300),
         ..Default::default()
     });
-    let server = start_server(stub.clone(), |cfg| cfg.recv_dir = recv_dir.clone()).await;
+    // Small chunks acknowledged one at a time: 512 request/ack round trips make the chunk phase
+    // long enough that heartbeats can land inside it on a fast machine, where 32 x 1 MiB over
+    // loopback could finish between two heartbeats and fail the overlap check without any
+    // starvation bug. Both ends must use the same chunk size and window.
+    const CHUNK: usize = 64 * 1024;
+    let server = start_snapshot_server(stub.clone(), &recv_dir, CHUNK, 1, IDLE, |_| {}).await;
     let stats = server.stats();
-    let mut cfg = config(CLUSTER, CLIENT_NODE);
-    cfg.recv_dir = recv_dir.clone();
+    let cfg = snap_cfg(CLIENT_NODE, &recv_dir, CHUNK, 1, IDLE);
 
     let mut snapshot_peer = client(&server, cfg.clone(), Lane::Snapshot).await;
     let mut heartbeat_peer = client(&server, cfg, Lane::Heartbeat).await;
@@ -2021,7 +2025,7 @@ async fn snapshot_does_not_starve_heartbeat() {
         stats.accepted(Lane::Snapshot) == 1
     })
     .await;
-    const TOTAL_CHUNKS: u64 = 32; // 32 MiB in 1 MiB chunks
+    const TOTAL_CHUNKS: u64 = 32 * 1024 * 1024 / CHUNK as u64;
     let mut rtts = Vec::new();
     let mut during_chunks = 0usize;
     let mut index = 100u64;
@@ -2037,7 +2041,7 @@ async fn snapshot_does_not_starve_heartbeat() {
             during_chunks += 1;
         }
         index += 1;
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        tokio::time::sleep(Duration::from_millis(2)).await;
     }
     snapshot_task.await.unwrap().expect("snapshot installed");
 
