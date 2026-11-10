@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 320" width="1280" height="320" role="img" aria-label="Lightcycle - grid-speed in-memory cache and Raft consensus engine">
+<title>Lightcycle</title>
+<defs><filter id="gb" x="-30%" y="-40%" width="160%" height="180%" color-interpolation-filters="sRGB"><feGaussianBlur in="SourceGraphic" stdDeviation="3.2" result="b1"/><feGaussianBlur in="SourceGraphic" stdDeviation="8.32" result="b2"/><feMerge><feMergeNode in="b2"/><feMergeNode in="b1"/><feMergeNode in="SourceGraphic"/></feMerge></filter><filter id="gt" x="-30%" y="-40%" width="160%" height="180%" color-interpolation-filters="sRGB"><feGaussianBlur in="SourceGraphic" stdDeviation="1.6" result="b1"/><feGaussianBlur in="SourceGraphic" stdDeviation="4.16" result="b2"/><feMerge><feMergeNode in="b2"/><feMergeNode in="b1"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+<linearGradient id="bgb" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#03060f"/><stop offset=".53" stop-color="#081a36"/><stop offset="1" stop-color="#03060f"/></linearGradient>
+<linearGradient id="sa" x1="0" x2="1"><stop offset="0" stop-color="#00e5ff" stop-opacity="0"/><stop offset="1" stop-color="#00e5ff"/></linearGradient>
+<linearGradient id="sb" x1="1" x2="0"><stop offset="0" stop-color="#00e5ff" stop-opacity="0"/><stop offset="1" stop-color="#00e5ff"/></linearGradient>
+<linearGradient id="fade" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#fff" stop-opacity="1"/><stop offset="1" stop-color="#fff" stop-opacity=".25"/></linearGradient>
+<mask id="gm"><rect x="0" y="170" width="1280" height="150" fill="url(#fade)"/></mask>
+<linearGradient id="vig" x1="0" x2="1"><stop offset="0" stop-color="#03060f" stop-opacity=".9"/><stop offset=".2" stop-color="#03060f" stop-opacity="0"/><stop offset=".8" stop-color="#03060f" stop-opacity="0"/><stop offset="1" stop-color="#03060f" stop-opacity=".9"/></linearGradient></defs>
+<rect width="1280" height="320" fill="url(#bgb)"/>
+<g mask="url(#gm)"><path d="M640 170 L-344.6 320M640 170 L-283.1 320M640 170 L-221.5 320M640 170 L-160.0 320M640 170 L-98.5 320M640 170 L-36.9 320M640 170 L24.6 320M640 170 L86.2 320M640 170 L147.7 320M640 170 L209.2 320M640 170 L270.8 320M640 170 L332.3 320M640 170 L393.8 320M640 170 L455.4 320M640 170 L516.9 320M640 170 L578.5 320M640 170 L640.0 320M640 170 L701.5 320M640 170 L763.1 320M640 170 L824.6 320M640 170 L886.2 320M640 170 L947.7 320M640 170 L1009.2 320M640 170 L1070.8 320M640 170 L1132.3 320M640 170 L1193.8 320M640 170 L1255.4 320M640 170 L1316.9 320M640 170 L1378.5 320M640 170 L1440.0 320M640 170 L1501.5 320M640 170 L1563.1 320M640 170 L1624.6 320M0 171.2 H1280M0 175.5 H1280M0 183.4 H1280M0 195.2 H1280M0 211.2 H1280M0 231.5 H1280M0 256.3 H1280M0 285.8 H1280M0 320.0 H1280" stroke="#18a0ff" stroke-width="1" fill="none" opacity="0.5"/></g>
+<path d="M0 170 H1280" stroke="#00e5ff" stroke-width="1.5" opacity=".7"/>
+<g filter="url(#gt)" mask="url(#gm)"><path d="M572.8 170 L80 320" stroke="#00e5ff" stroke-width="3" fill="none"/><path d="M584.8 170 L180 320" stroke="#18a0ff" stroke-width="2" fill="none"/><path d="M695.2 170 L1100 320" stroke="#00e5ff" stroke-width="3" fill="none"/><path d="M707.2 170 L1200 320" stroke="#18a0ff" stroke-width="2" fill="none"/><path d="M602.8 170 L330 320" stroke="#18a0ff" stroke-width="1.5" fill="none"/><path d="M677.2 170 L950 320" stroke="#18a0ff" stroke-width="1.5" fill="none"/></g>
+<g filter="url(#gt)"><path d="M0 70 H300" stroke="url(#sa)" stroke-width="3" fill="none"/><path d="M0 98 H190" stroke="url(#sa)" stroke-width="1.8" fill="none"/><path d="M0 236 H150" stroke="url(#sa)" stroke-width="1.5" fill="none"/><path d="M1280 60 H1000" stroke="url(#sb)" stroke-width="1.8" fill="none"/><path d="M1280 92 H1130" stroke="url(#sb)" stroke-width="3" fill="none"/><path d="M1280 250 H1150" stroke="url(#sb)" stroke-width="1.5" fill="none"/></g>
+<rect width="1280" height="320" fill="url(#vig)"/>
+<g filter="url(#gb)"><g transform="translate(214.7 23.0) scale(1.4)"><defs>
+<linearGradient id="trb" gradientUnits="userSpaceOnUse" x1="-60" x2="40" y1="0" y2="0"><stop offset="0" stop-color="#00e5ff" stop-opacity="0"/><stop offset="1" stop-color="#00e5ff"/></linearGradient>
+<linearGradient id="bdb" x1="0" x2="1" y1="0" y2="0"><stop offset="0" stop-color="#18a0ff"/><stop offset="1" stop-color="#00e5ff"/></linearGradient></defs>
+<path d="M-60 87 H40" stroke="url(#trb)" stroke-width="5.5" fill="none"/>
+<path d="M-30 78 H24" stroke="url(#trb)" stroke-width="2.5" fill="none"/>
+<path d="M-10 96 H30" stroke="url(#trb)" stroke-width="2" fill="none"/>
+<path d="M14 58 L48 36 L80 19 L106 32 L158 70 L120 66 L62 63 Z" fill="#04122a" stroke="url(#bdb)" stroke-width="4.5" stroke-linejoin="miter"/>
+<path d="M60 31 L80 22 L96 29 L74 36 Z" fill="#00e5ff" opacity=".9"/>
+<path d="M82 19 L106 32 L150 66" fill="none" stroke="#e8fcff" stroke-width="2" stroke-linecap="round" opacity=".85"/>
+<g fill="#04122a" stroke="#00e5ff" stroke-width="5">
+<circle cx="40" cy="70" r="19"/><circle cx="124" cy="70" r="19"/></g>
+<circle cx="40" cy="70" r="4" fill="#e8fcff"/><circle cx="124" cy="70" r="4" fill="#e8fcff"/></g>
+<g transform="translate(468.7 62.4) scale(1.7)"><g fill="none" stroke="#00e5ff" stroke-width="6.5" stroke-linejoin="miter" stroke-linecap="butt"><path transform="translate(0 0)" d="M0 0V36H24"/><path transform="translate(39 0)" d="M0 0V36"/><path transform="translate(54 0)" d="M24 6L18 0H6L0 6V30L6 36H18L24 30V18H13"/><path transform="translate(93 0)" d="M0 0V36M24 0V36M0 18H24"/><path transform="translate(132 0)" d="M0 0H24M12 0V36"/><path transform="translate(171 0)" d="M24 6L18 0H6L0 6V30L6 36H18L24 30"/><path transform="translate(210 0)" d="M0 0L12 18L24 0M12 18V36"/><path transform="translate(249 0)" d="M24 6L18 0H6L0 6V30L6 36H18L24 30"/><path transform="translate(288 0)" d="M0 0V36H24"/><path transform="translate(327 0)" d="M24 0H0V36H24M0 18H18"/></g></g></g>
+<text x="640" y="178" text-anchor="middle" font-family="ui-monospace,Menlo,Consolas,'DejaVu Sans Mono',monospace" font-size="13" letter-spacing="5" fill="#18a0ff" opacity="0">.</text>
+</svg>

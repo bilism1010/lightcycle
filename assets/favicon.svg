@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="Lightcycle">
+<title>Lightcycle</title>
+<defs><filter id="gf" x="-30%" y="-40%" width="160%" height="180%" color-interpolation-filters="sRGB"><feGaussianBlur in="SourceGraphic" stdDeviation="0.9" result="b1"/><feGaussianBlur in="SourceGraphic" stdDeviation="2.3400000000000003" result="b2"/><feMerge><feMergeNode in="b2"/><feMergeNode in="b1"/><feMergeNode in="SourceGraphic"/></feMerge></filter></defs>
+<rect width="64" height="64" rx="14" fill="#03060f"/>
+<rect x="1.5" y="1.5" width="61" height="61" rx="12.5" fill="none" stroke="#00e5ff" stroke-opacity=".55" stroke-width="1.5"/>
+<g filter="url(#gf)" stroke-linejoin="miter" transform="translate(1.6 1.2) scale(.93)">
+<path d="M2 51 H16" stroke="#00e5ff" stroke-width="3.2" opacity=".6" fill="none"/>
+<path d="M8 40 L20 31 L32 25 L41 29.5 L60 43 L46 42 L25 41 Z" fill="#04122a" stroke="#18a0ff" stroke-width="3.4"/>
+<circle cx="17.5" cy="43" r="7.5" fill="#04122a" stroke="#00e5ff" stroke-width="4"/>
+<circle cx="47.5" cy="43" r="7.5" fill="#04122a" stroke="#00e5ff" stroke-width="4"/></g>
+</svg>

@@ -1,13 +1,10 @@
 <div align="center">
 
-```text
-██╗     ██╗ ██████╗ ██╗  ██╗████████╗ ██████╗██╗   ██╗ ██████╗██╗     ███████╗
-██║     ██║██╔════╝ ██║  ██║╚══██╔══╝██╔════╝╚██╗ ██╔╝██╔════╝██║     ██╔════╝
-██║     ██║██║  ███╗███████║   ██║   ██║      ╚████╔╝ ██║     ██║     █████╗  
-██║     ██║██║   ██║██╔══██║   ██║   ██║       ╚██╔╝  ██║     ██║     ██╔══╝  
-███████╗██║╚██████╔╝██║  ██║   ██║   ╚██████╗   ██║   ╚██████╗███████╗███████╗
-╚══════╝╚═╝ ╚═════╝ ╚═╝  ╚═╝   ╚═╝    ╚═════╝   ╚═╝    ╚═════╝╚══════╝╚══════╝
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.svg">
+  <source media="(prefers-color-scheme: light)" srcset="assets/logo-light.svg">
+  <img src="assets/logo.svg" alt="Lightcycle - grid-speed in-memory cache and Raft consensus engine" width="640">
+</picture>
 
 ### **GRID-SPEED IN-MEMORY CACHE & RAFT CONSENSUS ENGINE**
 
@@ -134,6 +131,20 @@ at your option.
 
 ### Commercial & Enterprise Inquiries
 As the creator and copyright holder, Bill Sommers retains ownership of the codebase. Enterprise extensions, bespoke integration, commercial distribution rights, and managed hosting solutions are available under customized commercial licensing agreements. For inquiries, contact the author.
+
+---
+
+## 🎨 Brand Assets
+
+Original light-trail artwork in the Grid palette (`#00e5ff`, `#18a0ff`, `#03060f`). All SVGs are hand-written, self-contained, and use no external fonts.
+
+| File | Purpose |
+| :--- | :--- |
+| [`assets/logo.svg`](assets/logo.svg) | Horizontal logo, transparent background |
+| [`assets/logo-dark.svg`](assets/logo-dark.svg) / [`assets/logo-light.svg`](assets/logo-light.svg) | Variants for dark and light themes |
+| [`assets/icon.svg`](assets/icon.svg) | Square app icon (PNG: [512](assets/icon-512.png), [256](assets/icon-256.png), [64](assets/icon-64.png), [32](assets/icon-32.png)) |
+| [`assets/favicon.svg`](assets/favicon.svg) | Simplified mark for 16-32px use |
+| [`assets/banner.svg`](assets/banner.svg) | 1280x320 hero banner ([PNG](assets/banner.png)) |
 
 ---
 
