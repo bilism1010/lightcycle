@@ -116,6 +116,12 @@ fn advertised_addr(advertise: Option<&str>, local: SocketAddr) -> anyhow::Result
         .rsplit_once(':')
         .filter(|(host, port)| !host.is_empty() && port.parse::<u16>().is_ok())
         .context("--advertise must be host:port")?;
+    // An unbracketed IPv6 address (`::1:7443`) splits into a host and a "port" that is really
+    // the last group; it is ambiguous and not dialable. IPv6 needs brackets: `[::1]:7443`.
+    anyhow::ensure!(
+        !host.contains(':') || (host.starts_with('[') && host.ends_with(']')),
+        "--advertise {advertise:?} looks like an unbracketed IPv6 address; write it as [addr]:port"
+    );
     let port: u16 = port.parse().context("--advertise port")?;
     let port = if port == 0 { local.port() } else { port };
     Ok(format!("{host}:{port}"))
@@ -361,6 +367,16 @@ mod tests {
         assert!(advertised_addr(Some("no-port"), local("10.0.0.5:7443")).is_err());
         assert!(advertised_addr(Some(":7443"), local("10.0.0.5:7443")).is_err());
         assert!(advertised_addr(Some("host:notaport"), local("10.0.0.5:7443")).is_err());
+    }
+
+    #[test]
+    fn unbracketed_ipv6_advertise_is_refused() {
+        let here = local("10.0.0.5:7443");
+        assert!(advertised_addr(Some("::1:7443"), here).is_err());
+        assert!(advertised_addr(Some("fe80::1:7443"), here).is_err());
+        // Bracketed forms are fine, whether or not std parses them as a SocketAddr.
+        assert_eq!(advertised_addr(Some("[2001:db8::1]:7443"), here).unwrap(), "[2001:db8::1]:7443");
+        assert_eq!(advertised_addr(Some("[fe80::1%eth0]:7443"), here).unwrap(), "[fe80::1%eth0]:7443");
     }
 
     #[test]
