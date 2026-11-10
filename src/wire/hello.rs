@@ -80,6 +80,9 @@ pub enum HandshakeError {
         /// Node id the caller meant to reach.
         expected: u64,
     },
+    /// The peer announced this node's own id: a self-dial or a mis-wired membership.
+    #[error("peer announced this node's own id {0}")]
+    SelfDial(u64),
     /// The first frame was not the expected handshake frame.
     #[error("unexpected frame during handshake")]
     UnexpectedFrame,
@@ -156,6 +159,7 @@ fn reason_of(err: &HandshakeError) -> &'static str {
         HandshakeError::BadMagic => "bad magic",
         HandshakeError::VersionMismatch { .. } => "wire version mismatch",
         HandshakeError::ClusterMismatch { .. } => "cluster id mismatch",
+        HandshakeError::SelfDial(_) => "node id is the server's own",
         HandshakeError::UnexpectedFrame => "unexpected frame",
         _ => "handshake rejected",
     }
@@ -198,6 +202,8 @@ where
                     theirs: hello.cluster_id,
                     ours: expected_cluster_id,
                 })
+            } else if hello.node_id == my_node_id {
+                Err(HandshakeError::SelfDial(hello.node_id))
             } else {
                 Ok(hello)
             }
@@ -381,6 +387,21 @@ mod tests {
         }
         match cr.unwrap_err() {
             HandshakeError::Remote(reason) => assert_eq!(reason, "cluster id mismatch"),
+            other => panic!("expected Remote, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_a_peer_that_announces_the_servers_own_id() {
+        let (mut c, mut s) = pair();
+        let hello = Hello::new(1, 9, Lane::Replication);
+        let (cr, sr) = tokio::join!(
+            client_handshake(&mut c, hello, T),
+            server_handshake(&mut s, 1, 9, T)
+        );
+        assert!(matches!(sr.unwrap_err(), HandshakeError::SelfDial(9)));
+        match cr.unwrap_err() {
+            HandshakeError::Remote(reason) => assert_eq!(reason, "node id is the server's own"),
             other => panic!("expected Remote, got {other:?}"),
         }
     }

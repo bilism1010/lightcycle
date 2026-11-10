@@ -26,6 +26,7 @@ use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::codec::Framed;
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 
 use crate::net::client::TcpNetConfig;
 use crate::net::handler::RaftHandler;
@@ -231,11 +232,17 @@ async fn serve_connection(
     framed
         .codec_mut()
         .set_max_frame_length(cfg.lane_frame_cap(lane));
-    if lane == Lane::Snapshot {
-        run_snapshot_lane(framed, cfg, handler, stats, snapshot_slots, cancel).await;
-    } else {
-        run_lane(framed, lane, cfg, handler, stats, cancel).await;
+    // Every log line of this connection carries who is on the other end.
+    let span = tracing::debug_span!("peer", peer_node = hello.node_id, lane = ?lane);
+    async {
+        if lane == Lane::Snapshot {
+            run_snapshot_lane(framed, cfg, handler, stats, snapshot_slots, cancel).await;
+        } else {
+            run_lane(framed, lane, cfg, handler, stats, cancel).await;
+        }
     }
+    .instrument(span)
+    .await;
 }
 
 /// Drain the connection's outgoing queue into the socket; cancels the connection on exit.
