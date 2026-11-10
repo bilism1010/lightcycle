@@ -89,6 +89,15 @@ fn valid_record_follows(image: &[u8], from: usize) -> bool {
         .any(|p| matches!(decode_record(&image[p..]), Decoded::Record { .. }))
 }
 
+/// Operator guidance appended to the "valid records follow damage" errors. Recovery refuses to
+/// start rather than guess, and leaves the segment files exactly as found.
+const OPERATOR_HINT: &str = "the segment files were left untouched. Two causes look the same: \
+    media corruption, or a power loss that persisted later pages of an unsynced write but not \
+    earlier ones (nothing in that case was acknowledged). To proceed, restore this node's data \
+    directory from a backup, or, if the rest of the cluster holds the data, move the directory \
+    aside and restart the node empty so it rejoins and catches up from the leader; do not delete \
+    individual segments by hand";
+
 /// Running state of the scan.
 struct Scanner {
     state: PreambleState,
@@ -173,8 +182,10 @@ impl Scanner {
                     return Err(corrupt(
                         seq,
                         off,
-                        "valid records follow an invalid record in the last segment: \
-                         corruption, not a torn tail",
+                        format!(
+                            "valid records follow an invalid record in the last segment, which \
+                             a plain torn tail cannot produce; {OPERATOR_HINT}"
+                        ),
                     ));
                 }
                 Decoded::End => break,
@@ -284,7 +295,7 @@ fn head_is_unwritten(seq: u64, image: &[u8]) -> Result<bool, WalError> {
         Decoded::Invalid if valid_record_follows(image, 1) => Err(corrupt(
             seq,
             0,
-            "damaged preamble with valid records behind it",
+            format!("damaged preamble with valid records behind it; {OPERATOR_HINT}"),
         )),
         Decoded::Invalid => Ok(true),
         Decoded::End => match image.iter().position(|b| *b != 0) {
