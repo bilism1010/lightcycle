@@ -4,5 +4,7 @@
 //! bounded before any allocation.
 
 pub mod frame;
+pub mod hello;
 
 pub use frame::{Frame, FrameCodec, FrameError, FrameHeader, Lane};
+pub use hello::{client_handshake, server_handshake, HandshakeError, Hello};
