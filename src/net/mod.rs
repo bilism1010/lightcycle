@@ -2,3 +2,7 @@
 //!
 //! Invariants: replication, heartbeat and snapshot traffic use separate connections per peer
 //! (interpretation A4); the fake network is gated behind `any(test, feature = "test-util")`.
+
+#[cfg(any(test, feature = "test-util"))]
+pub mod fake;
+pub mod handler;
