@@ -96,6 +96,12 @@ impl RaftHandler for DeferredHandler {
         file: SnapshotFile,
     ) -> BoxFuture<'static, Result<SnapshotResponse<TypeConfig>, Fatal<TypeConfig>>> {
         match self.inner.get() {
+            // `RaftNode::start` empties the receive directory before this handler is set. This
+            // test binds the server first, so a transfer that began while the node was starting
+            // can have its file deleted by that cleanup. The handler is only visible after the
+            // cleanup finished, so checking here is race-free: refuse such a transfer like a
+            // not-yet-started node, and the leader simply retries the snapshot.
+            Some(_) if !file.path.exists() => Box::pin(async { Err(Fatal::Stopped) }),
             Some(h) => h.install_snapshot(vote, meta, file),
             None => Box::pin(async { Err(Fatal::Stopped) }),
         }
