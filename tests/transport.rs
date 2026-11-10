@@ -272,6 +272,27 @@ async fn hello_cluster_mismatch_rejected_over_tcp() {
 }
 
 #[tokio::test]
+async fn wrong_node_at_the_dialed_address_is_rejected_over_tcp() {
+    let stub = Arc::new(StubHandler::default());
+    let server = start_server(stub.clone(), |_| {}).await;
+    // The membership says node SERVER_NODE + 1 lives at this address, but node SERVER_NODE
+    // answers: its votes must never be attributed to the other node.
+    let node = BasicNode::new(server.local_addr().to_string());
+    let mut factory = TcpNetworkFactory::new(config(CLUSTER, CLIENT_NODE));
+    let mut peer = factory.new_client(SERVER_NODE + 1, &node).await;
+
+    let err = peer.vote(vote_req(), opt()).await.expect_err("must be rejected");
+    assert!(matches!(err, RPCError::Unreachable(_)), "got {err:?}");
+    assert_eq!(stub.votes.load(Ordering::SeqCst), 0, "no vote may reach the handler");
+
+    // The right target is served normally.
+    let mut right = client(&server, config(CLUSTER, CLIENT_NODE), Lane::Replication).await;
+    right.vote(vote_req(), opt()).await.expect("vote");
+    assert_eq!(stub.votes.load(Ordering::SeqCst), 1);
+    server.shutdown().await;
+}
+
+#[tokio::test]
 async fn handshake_timeout_closes_silent_connection() {
     let stub = Arc::new(StubHandler::default());
     let server = start_server(stub, |cfg| {

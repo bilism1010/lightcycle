@@ -72,6 +72,14 @@ pub enum HandshakeError {
         /// Our cluster id.
         ours: u64,
     },
+    /// The peer is a different node than the one dialed (a stale or wrong membership address).
+    #[error("node id mismatch: peer identified as node {theirs}, expected node {expected}")]
+    NodeMismatch {
+        /// Node id the peer announced.
+        theirs: u64,
+        /// Node id the caller meant to reach.
+        expected: u64,
+    },
     /// The first frame was not the expected handshake frame.
     #[error("unexpected frame during handshake")]
     UnexpectedFrame,
@@ -221,6 +229,21 @@ pub async fn client_handshake<T>(
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
+    client_handshake_expecting(framed, hello, None, timeout).await
+}
+
+/// [`client_handshake`] that also rejects a server whose Hello names a node other than
+/// `expected_node_id` or a lane other than the one requested. Dialing the wrong node of the same
+/// cluster would otherwise attribute its votes and acknowledgements to the intended target.
+pub async fn client_handshake_expecting<T>(
+    framed: &mut Framed<T, FrameCodec>,
+    hello: Hello,
+    expected_node_id: Option<u64>,
+    timeout: Duration,
+) -> Result<Hello, HandshakeError>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
     let exchange = async {
         framed
             .send(Frame::new(KIND_HELLO, hello.lane, 0, hello.encode()))
@@ -238,6 +261,17 @@ where
                         theirs: theirs.cluster_id,
                         ours: hello.cluster_id,
                     });
+                }
+                if let Some(expected) = expected_node_id {
+                    if theirs.node_id != expected {
+                        return Err(HandshakeError::NodeMismatch {
+                            theirs: theirs.node_id,
+                            expected,
+                        });
+                    }
+                }
+                if expected_node_id.is_some() && theirs.lane != hello.lane {
+                    return Err(HandshakeError::UnexpectedFrame);
                 }
                 Ok(theirs)
             }
@@ -286,6 +320,35 @@ mod tests {
         assert_eq!(server_view.cluster_id, 42);
         assert_eq!(server_view.lane, Lane::Snapshot);
         assert_eq!(server_view.wire_version, WIRE_VERSION);
+    }
+
+    #[tokio::test]
+    async fn client_rejects_a_server_that_is_not_the_expected_node() {
+        let (mut c, mut s) = pair();
+        let hello = Hello::new(42, 7, Lane::Replication);
+        let (cr, _sr) = tokio::join!(
+            client_handshake_expecting(&mut c, hello, Some(3), T),
+            server_handshake(&mut s, 42, 9, T)
+        );
+        assert!(
+            matches!(cr, Err(HandshakeError::NodeMismatch { theirs: 9, expected: 3 })),
+            "{cr:?}"
+        );
+
+        let (mut c, mut s) = pair();
+        let (cr, _sr) = tokio::join!(
+            client_handshake_expecting(&mut c, hello, Some(9), T),
+            server_handshake(&mut s, 42, 9, T)
+        );
+        assert_eq!(cr.unwrap().node_id, 9);
+
+        // Without an expectation any node of the cluster is accepted (the plain entry point).
+        let (mut c, mut s) = pair();
+        let (cr, _sr) = tokio::join!(
+            client_handshake(&mut c, hello, T),
+            server_handshake(&mut s, 42, 9, T)
+        );
+        assert_eq!(cr.unwrap().node_id, 9);
     }
 
     #[tokio::test]

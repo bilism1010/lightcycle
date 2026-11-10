@@ -7,4 +7,6 @@ pub mod frame;
 pub mod hello;
 
 pub use frame::{Frame, FrameCodec, FrameError, FrameHeader, Lane};
-pub use hello::{client_handshake, server_handshake, HandshakeError, Hello};
+pub use hello::{
+    client_handshake, client_handshake_expecting, server_handshake, HandshakeError, Hello,
+};

@@ -43,7 +43,7 @@ use crate::net::protocol::{
 };
 use crate::raft::types::{SnapshotFile, TypeConfig};
 use crate::wire::frame::{Frame, FrameCodec, FrameError, Lane, HEADER_LEN, KIND_ERROR};
-use crate::wire::hello::{client_handshake, HandshakeError, Hello};
+use crate::wire::hello::{client_handshake_expecting, HandshakeError, Hello};
 
 /// Frame cap in force until the server's HelloAck has arrived.
 const PRE_HELLO_FRAME_CAP: usize = 4096;
@@ -228,7 +228,16 @@ impl PeerClient {
         let _ = stream.set_nodelay(true);
         let mut framed = Framed::new(stream, FrameCodec::new(PRE_HELLO_FRAME_CAP));
         let hello = Hello::new(self.cfg.cluster_id, self.cfg.node_id, self.lane);
-        match client_handshake(&mut framed, hello, self.cfg.handshake_timeout).await {
+        // The server's Hello must name the node this client targets: a stale or wrong membership
+        // address would otherwise let another node of the cluster answer in its place.
+        match client_handshake_expecting(
+            &mut framed,
+            hello,
+            Some(self.target),
+            self.cfg.handshake_timeout,
+        )
+        .await
+        {
             Ok(_) => {}
             Err(HandshakeError::Timeout) => {
                 return Err(self.timeout_err(action, self.cfg.handshake_timeout))
