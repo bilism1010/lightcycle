@@ -539,3 +539,77 @@ async fn membership_remove_leader_new_leader_elected() {
     cluster.wait_voters(&remaining, &set_of(&remaining)).await;
     cluster.assert_contain_and_identical(&remaining, &acked).await;
 }
+
+// ---------------------------------------------------------------------------------------------
+// Snapshot catch-up after log purge (plan 03-16).
+// ---------------------------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn kill_restart_snapshot_catchup() {
+    let opts = ClusterOpts {
+        use_fake_io: false,
+        snapshot_every: 50,
+        segment_size: 4096,
+        max_in_snapshot_log_to_keep: 10,
+        purge_batch_size: 10,
+    };
+    let mut cluster = TestCluster::start(3, opts).await;
+    let leader = cluster.leader().await;
+    // Lag a follower and restart the other one, so the leader is never the one taken out.
+    let mut followers = (1..=3u64).filter(|id| *id != leader);
+    let lagging = followers.next().unwrap();
+    let restarted = followers.next().unwrap();
+    let up = [leader, restarted];
+
+    write_keys(&cluster, "base", 0..5).await;
+    let base = expect_map("base", 0..5);
+    cluster.wait_converged(&[1, 2, 3], &base).await;
+
+    // Isolate the lagging follower and hold on to its engine as of now.
+    cluster.ctl.isolate(lagging);
+    let before = cluster.node(lagging).engine();
+    let lagging_last_log = cluster.node(lagging).metrics().last_log_index.expect("has a log");
+
+    write_keys_among(&cluster, &up, "s", 0..300).await;
+    let mut expected = base.clone();
+    expected.extend(expect_map("s", 0..300));
+    cluster.wait_converged(&up, &expected).await;
+
+    // The leader snapshots and purges its log past everything the lagging follower has.
+    eventually(Duration::from_secs(30), "leader snapshot at index >= 50 and log purged past the lagging follower", || {
+        let m = cluster.node(leader).metrics();
+        let snap = m.snapshot.map(|l| l.index);
+        let purged = m.purged.map(|l| l.index);
+        async move { snap.is_some_and(|i| i >= 50) && purged.is_some_and(|p| p > lagging_last_log) }
+    })
+    .await;
+
+    // Graceful kill and restart of the other follower: it recovers from its own snapshot plus
+    // log and the pair {leader, restarted} keeps committing while the third node is still cut off.
+    cluster.kill(restarted).await;
+    cluster.restart(restarted).await;
+    write_keys_among(&cluster, &up, "t", 0..20).await;
+    expected.extend(expect_map("t", 0..20));
+    cluster.wait_converged(&up, &expected).await;
+
+    // Heal: the lagging follower can only catch up from a snapshot because the log is purged.
+    cluster.ctl.heal();
+    cluster.wait_converged(&[lagging], &expected).await; // fresh engine() on every poll
+    let after = cluster.node(lagging).engine();
+    assert!(
+        !Arc::ptr_eq(&before, &after),
+        "engine() must follow the install_snapshot swap: the handle is still the pre-heal engine"
+    );
+    assert_eq!(dump(&before), base, "the pre-heal engine handle must not have gained the new keys");
+
+    let stats = cluster.ctl.stats();
+    assert!(stats.snapshot.delivered >= 1, "no snapshot lane delivery: {stats:?}");
+    eventually(WAIT, "lagging follower reports an installed snapshot at index >= 50", || {
+        let snap = cluster.node(lagging).metrics().snapshot.map(|l| l.index);
+        async move { snap.is_some_and(|i| i >= 50) }
+    })
+    .await;
+
+    // No acknowledged write is missing anywhere and the three nodes are identical.
+    cluster.assert_contain_and_identical(&[1, 2, 3], &expected).await;
+}
