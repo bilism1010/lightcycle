@@ -299,10 +299,34 @@ impl RaftStateMachine<TypeConfig> for KvStateMachine {
 
     async fn install_snapshot(
         &mut self,
-        _meta: &SnapshotMetaOf<TypeConfig>,
-        _snapshot: SnapshotFile,
+        meta: &SnapshotMetaOf<TypeConfig>,
+        snapshot: SnapshotFile,
     ) -> Result<(), io::Error> {
-        Err(io::Error::new(io::ErrorKind::Unsupported, "install_snapshot is not implemented yet"))
+        // Order is fixed (D-09): validate + load into a fresh engine, make the file durable as
+        // the single current snapshot, and only then swap the engine. Any failure before the
+        // swap changes nothing, so a corrupt or mismatched file can never replace live state
+        // (T-03-31).
+        let store = self.snapshots.clone().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::Unsupported, "snapshots are not configured")
+        })?;
+        let expected = meta.clone();
+        let path = snapshot.path;
+        let engine = tokio::task::spawn_blocking(move || {
+            // The file is validated twice by design (once while loading here, once inside
+            // `install_received`) to keep the failure ordering simple; a single-pass
+            // optimization is out of scope for correctness-focused Phase 3.
+            let (header, engine) = load_snapshot(&path)?;
+            if header != expected {
+                return Err(SnapshotError::MetaMismatch);
+            }
+            store.install_received(&path, &expected)?;
+            Ok::<_, SnapshotError>(engine)
+        })
+        .await
+        .map_err(join_error)?
+        .map_err(snapshot_io_error)?;
+        self.replace_engine(engine, meta.last_log_id.clone(), meta.last_membership.clone());
+        Ok(())
     }
 
     async fn get_current_snapshot(
@@ -352,6 +376,231 @@ mod tests {
                 .map(|i| Ok((normal(i, set(&format!("key{i}"), &format!("val{i}"))), None)))
                 .collect::<Vec<_>>(),
         )
+    }
+
+    /// A mixed Set/Delete stream over seven keys, so later entries overwrite and delete earlier
+    /// ones.
+    fn mixed_stream(
+        range: std::ops::RangeInclusive<u64>,
+    ) -> impl Stream<Item = Result<EntryResponder<TypeConfig>, io::Error>> + Unpin {
+        futures::stream::iter(
+            range
+                .map(|i| {
+                    let key = b(&format!("k{}", i % 7));
+                    let req = if i % 5 == 0 {
+                        KvRequest::Delete { key }
+                    } else {
+                        KvRequest::Set { key, value: b(&format!("v{i}")) }
+                    };
+                    Ok((normal(i, req), None))
+                })
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    /// Names of the published `.snap` files in `dir`, sorted.
+    fn snap_files(dir: &std::path::Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .filter(|n| n.ends_with(".snap"))
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// Copy `snap`'s file into `target`'s staging area, as the network layer would on receive.
+    fn stage_received(target: &KvStateMachine, snap: &SnapshotOf<TypeConfig, SnapshotFile>) -> SnapshotFile {
+        let staging = target.snapshots.as_ref().unwrap().staging_path(&snap.meta);
+        std::fs::copy(&snap.snapshot.path, &staging).unwrap();
+        SnapshotFile { path: staging, len: snap.snapshot.len }
+    }
+
+    /// A machine in `dir` holding `key{i} = val{i}` for `range`, plus a snapshot of it.
+    async fn machine_with_snapshot(
+        dir: &std::path::Path,
+        range: std::ops::RangeInclusive<u64>,
+    ) -> (KvStateMachine, SnapshotOf<TypeConfig, SnapshotFile>) {
+        let mut sm = KvStateMachine::open(dir).await.unwrap();
+        sm.apply(set_stream(range)).await.unwrap();
+        let snap = sm.get_snapshot_builder().await.build_snapshot().await.unwrap();
+        (sm, snap)
+    }
+
+    #[tokio::test]
+    async fn no_overlapping_snapshot_builds() {
+        let mut sm = KvStateMachine::new();
+        let first = sm.try_create_snapshot_builder(false).await;
+        assert!(first.is_some());
+        assert!(sm.try_create_snapshot_builder(false).await.is_none());
+        drop(first);
+        assert!(sm.try_create_snapshot_builder(false).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn build_without_store_reports_not_configured() {
+        let mut sm = KvStateMachine::new();
+        let err = sm.get_snapshot_builder().await.build_snapshot().await.unwrap_err();
+        assert!(err.to_string().contains("not configured"), "{err}");
+        assert!(sm.get_current_snapshot().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn install_snapshot_replaces_state_and_reports_applied() {
+        let (dir_a, dir_b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (_a, snap) = machine_with_snapshot(dir_a.path(), 1..=10).await;
+        let mut b_sm = KvStateMachine::open(dir_b.path()).await.unwrap();
+        b_sm.apply(mixed_stream(1..=4)).await.unwrap();
+        let old_engine = b_sm.engine();
+
+        let received = stage_received(&b_sm, &snap);
+        b_sm.install_snapshot(&snap.meta, received).await.unwrap();
+
+        for i in 1..=10u64 {
+            assert_eq!(
+                b_sm.engine().get(format!("key{i}").as_bytes()),
+                Some(b(&format!("val{i}")))
+            );
+        }
+        assert_eq!(b_sm.engine().get(b"k1"), None, "old contents must be gone");
+        let (applied, membership) = RaftStateMachine::applied_state(&mut b_sm).await.unwrap();
+        assert_eq!(applied, snap.meta.last_log_id);
+        assert_eq!(membership, snap.meta.last_membership);
+        // A reader holding the old Arc still sees the old data.
+        assert_eq!(old_engine.get(b"k1"), Some(b("v1")));
+        assert_eq!(old_engine.get(b"key1"), None);
+    }
+
+    #[tokio::test]
+    async fn engine_handle_tracks_install_snapshot() {
+        let (dir_a, dir_b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (_a, snap) = machine_with_snapshot(dir_a.path(), 1..=10).await;
+        let mut b_sm = KvStateMachine::open(dir_b.path()).await.unwrap();
+        b_sm.apply(mixed_stream(1..=4)).await.unwrap();
+
+        // Cloned out exactly as RaftNode will before the machine moves into Raft::new.
+        let handle = b_sm.engine_handle();
+        let before = handle.load_full();
+
+        let received = stage_received(&b_sm, &snap);
+        b_sm.install_snapshot(&snap.meta, received).await.unwrap();
+
+        let after = handle.load_full();
+        assert!(!Arc::ptr_eq(&before, &after));
+        assert_eq!(after.get(b"key10"), Some(b("val10")));
+        assert_eq!(before.get(b"k1"), Some(b("v1")));
+        assert_eq!(before.get(b"key10"), None);
+        assert!(Arc::ptr_eq(&b_sm.engine(), &after));
+    }
+
+    #[tokio::test]
+    async fn install_rejects_corrupt_file_and_keeps_old_engine() {
+        let (dir_a, dir_b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (_a, snap) = machine_with_snapshot(dir_a.path(), 1..=10).await;
+        let mut b_sm = KvStateMachine::open(dir_b.path()).await.unwrap();
+        b_sm.apply(mixed_stream(1..=4)).await.unwrap();
+        let engine_before = b_sm.engine();
+        let applied_before = KvStateMachine::applied_state(&b_sm);
+        let snaps_before = snap_files(dir_b.path());
+
+        let received = stage_received(&b_sm, &snap);
+        let mut bytes = std::fs::read(&received.path).unwrap();
+        let mid = bytes.len() / 2;
+        bytes[mid] ^= 0x01;
+        std::fs::write(&received.path, &bytes).unwrap();
+
+        let err = b_sm.install_snapshot(&snap.meta, received).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
+        assert!(Arc::ptr_eq(&engine_before, &b_sm.engine()));
+        assert_eq!(b_sm.engine().get(b"k1"), Some(b("v1")));
+        assert_eq!(b_sm.engine().get(b"key1"), None);
+        assert_eq!(KvStateMachine::applied_state(&b_sm), applied_before);
+        assert_eq!(snap_files(dir_b.path()), snaps_before);
+    }
+
+    #[tokio::test]
+    async fn install_rejects_meta_mismatch() {
+        let (dir_a, dir_b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (_a, snap) = machine_with_snapshot(dir_a.path(), 1..=10).await;
+        let mut b_sm = KvStateMachine::open(dir_b.path()).await.unwrap();
+        let received = stage_received(&b_sm, &snap);
+        let mut wrong = snap.meta.clone();
+        wrong.last_log_id = Some(log_id(11));
+        assert!(b_sm.install_snapshot(&wrong, received).await.is_err());
+        assert_eq!(b_sm.engine().get(b"key1"), None);
+        assert!(snap_files(dir_b.path()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn install_keeps_exactly_one_snapshot_on_disk() {
+        let (dir_a, dir_b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (_a, snap) = machine_with_snapshot(dir_a.path(), 1..=10).await;
+        let (mut b_sm, old) = machine_with_snapshot(dir_b.path(), 1..=3).await;
+        assert_eq!(snap_files(dir_b.path()).len(), 1);
+        assert_eq!(old.meta.last_log_id.as_ref().map(|l| l.index()), Some(3));
+
+        let received = stage_received(&b_sm, &snap);
+        b_sm.install_snapshot(&snap.meta, received).await.unwrap();
+
+        let files = snap_files(dir_b.path());
+        assert_eq!(files.len(), 1, "{files:?}");
+        let current = b_sm.get_current_snapshot().await.unwrap().unwrap();
+        assert_eq!(current.meta, snap.meta);
+    }
+
+    #[tokio::test]
+    async fn restart_loads_latest_snapshot_then_replays() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sm = KvStateMachine::open(dir.path()).await.unwrap();
+        sm.apply(mixed_stream(1..=50)).await.unwrap();
+        // The builder captures start index 50; entries 51..=80 land while it is outstanding, so
+        // the scan observes some of them (fuzzy).
+        let mut builder = sm.try_create_snapshot_builder(false).await.unwrap();
+        sm.apply(mixed_stream(51..=80)).await.unwrap();
+        let snap = builder.build_snapshot().await.unwrap();
+        assert_eq!(snap.meta.last_log_id.as_ref().map(|l| l.index()), Some(50));
+        drop(builder);
+        drop(sm);
+
+        let mut restarted = KvStateMachine::open(dir.path()).await.unwrap();
+        let (applied, _) = RaftStateMachine::applied_state(&mut restarted).await.unwrap();
+        assert_eq!(applied.map(|l| l.index()), Some(50));
+        restarted.apply(mixed_stream(51..=80)).await.unwrap();
+
+        let mut sequential = KvStateMachine::new();
+        sequential.apply(mixed_stream(1..=80)).await.unwrap();
+        for k in 0..7 {
+            let key = format!("k{k}");
+            assert_eq!(
+                restarted.engine().get(key.as_bytes()),
+                sequential.engine().get(key.as_bytes()),
+                "{key} differs"
+            );
+        }
+        assert_eq!(
+            KvStateMachine::applied_state(&restarted).0,
+            KvStateMachine::applied_state(&sequential).0
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_yields_every_256_entries() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let ticks = Arc::new(AtomicU64::new(0));
+        let ticker = {
+            let ticks = Arc::clone(&ticks);
+            tokio::spawn(async move {
+                loop {
+                    ticks.fetch_add(1, Ordering::Relaxed);
+                    tokio::task::yield_now().await;
+                }
+            })
+        };
+        let mut sm = KvStateMachine::new();
+        sm.apply(set_stream(1..=2000)).await.unwrap();
+        ticker.abort();
+        let seen = ticks.load(Ordering::Relaxed);
+        assert!(seen >= 7, "ticker ran only {seen} times during 2000 applies");
     }
 
     #[tokio::test]
