@@ -57,9 +57,13 @@ fn corrupt(seq: u64, offset: usize, reason: impl Into<String>) -> WalError {
     }
 }
 
-/// Reads a segment image (at most `cap` bytes) in full.
-fn read_image(io: &dyn SegmentIo, seq: u64, cap: u64) -> Result<Vec<u8>, WalError> {
-    let len = io.len(seq)?.min(cap);
+/// Reads a segment image in full, whatever its length.
+///
+/// The length is never capped by the configured segment size: a node restarted with a smaller
+/// `segment_size` must still see every record in segments created with the larger one, or a
+/// record straddling the cap would look like a torn tail and be destroyed.
+fn read_image(io: &dyn SegmentIo, seq: u64) -> Result<Vec<u8>, WalError> {
+    let len = io.len(seq)?;
     let len = usize::try_from(len).map_err(|_| io::Error::other("segment too large to read"))?;
     let mut buf = vec![0u8; len];
     let mut filled = 0;
@@ -312,7 +316,7 @@ pub fn recover(io: &mut dyn SegmentIo, cfg: &WalConfig) -> Result<RecoveredLog, 
     // The last segment decides whether a crash left a half-created file behind, so read it first.
     let mut last_image = None;
     if let Some(&last_seq) = seqs.last() {
-        let image = read_image(&*io, last_seq, cfg.segment_size)?;
+        let image = read_image(&*io, last_seq)?;
         if head_is_unwritten(last_seq, &image)? {
             // Crash right after creation (or mid-preamble): nothing in it was ever acknowledged
             // because the preceding segment holds every durable record.
@@ -339,7 +343,7 @@ pub fn recover(io: &mut dyn SegmentIo, cfg: &WalConfig) -> Result<RecoveredLog, 
         let is_last = i + 1 == count;
         let image = match last_image.take() {
             Some(image) if is_last => image,
-            _ => read_image(&*io, seq, cfg.segment_size)?,
+            _ => read_image(&*io, seq)?,
         };
         tail_offset = scanner.scan(seq, &image, is_last)?;
         if is_last {
@@ -347,9 +351,11 @@ pub fn recover(io: &mut dyn SegmentIo, cfg: &WalConfig) -> Result<RecoveredLog, 
             // stale valid-looking record could be resurrected later (T-03-18).
             let torn = image[tail_offset..].iter().filter(|b| **b != 0).count() as u64;
             if torn > 0 {
+                // Restore the full length, never shrinking a segment created with a larger size.
+                let restored = (image.len() as u64).max(cfg.segment_size);
                 io.set_len(seq, tail_offset as u64)?;
                 io.sync_segment(seq)?;
-                io.set_len(seq, cfg.segment_size)?;
+                io.set_len(seq, restored)?;
                 io.sync_segment(seq)?;
                 io.sync_dir()?;
                 torn_bytes_discarded = torn;
@@ -802,6 +808,37 @@ mod tests {
         let got = recover(&mut io, &b.cfg()).unwrap();
         assert_eq!(got.locations.len(), 7);
         assert!(got.torn_bytes_discarded > 0);
+    }
+
+    #[test]
+    fn segments_longer_than_the_configured_size_are_read_in_full() {
+        // Written with 4096-byte segments, reopened with a 2048-byte configuration.
+        let mut b = LogBuilder::new(SEG);
+        b.segment(1, PreambleState::default());
+        for i in 1..=4 {
+            b.entry(i, &[0xEE; 400]);
+        }
+        b.segment(5, PreambleState::default());
+        for i in 5..=9 {
+            b.entry(i, &[0xEE; 400]);
+        }
+        b.sync();
+        assert!(b.offset > 2048, "the last record must lie beyond the smaller cap");
+        let small = WalConfig { segment_size: 2048, ..WalConfig::default() };
+
+        let mut io = b.io.clone();
+        let got = recover(&mut io, &small).unwrap();
+        assert_eq!(indices(&got), (1..=9).collect::<Vec<_>>());
+        assert_eq!(got.torn_bytes_discarded, 0);
+        assert_eq!(got.start.tail_offset, b.offset);
+
+        // A real torn tail past the cap is repaired without shrinking the file.
+        io.write_at(2, b.offset, &[0xAB; 5]).unwrap();
+        io.sync_segment(2).unwrap();
+        let got = recover(&mut io, &small).unwrap();
+        assert_eq!(indices(&got), (1..=9).collect::<Vec<_>>());
+        assert_eq!(got.torn_bytes_discarded, 5);
+        assert_eq!(io.len(2).unwrap(), SEG);
     }
 
     #[test]
