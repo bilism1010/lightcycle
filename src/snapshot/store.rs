@@ -233,7 +233,11 @@ impl SnapshotStore {
         };
         hook(Stage::TmpWritten)?;
         hook(Stage::TmpSynced)?;
-        fs::rename(&tmp, &fin)?;
+        // A real rename failure must not leak the full-size `.tmp` (unlike a hook "crash").
+        if let Err(e) = fs::rename(&tmp, &fin) {
+            let _ = fs::remove_file(&tmp);
+            return Err(e.into());
+        }
         hook(Stage::Renamed)?;
         sync_dir(&self.dir)?;
         hook(Stage::DirSynced)?;
@@ -485,6 +489,10 @@ mod tests {
         // A directory squatting on the final name makes the rename fail after a good write.
         fs::create_dir(dir.path().join(file_name(3, 1, Ext::Snap))).unwrap();
         assert!(store.build(&engine(3), &meta(3, 1)).is_err());
+        assert!(
+            !dir.path().join(file_name(3, 1, Ext::Tmp)).exists(),
+            "the fully written .tmp must not be leaked by a failed rename"
+        );
     }
 
     #[test]
