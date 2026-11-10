@@ -2,3 +2,6 @@
 //!
 //! Invariants: appends are durable only after the group-commit fsync completes; each flush
 //! callback is completed exactly once; mid-log corruption is never treated as a torn tail.
+
+pub mod io;
+pub mod record;
