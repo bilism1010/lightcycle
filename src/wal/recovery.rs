@@ -295,6 +295,31 @@ fn head_is_unwritten(seq: u64, image: &[u8]) -> Result<bool, WalError> {
     }
 }
 
+/// Checks that the surviving log starts where the purge point says it should. The neighbour gap
+/// check cannot see a missing leading segment, and segments are only ever deleted after a purge
+/// marker is durable.
+fn validate_log_start(scanner: &Scanner, first_seq: u64) -> Result<(), WalError> {
+    match &scanner.state.purged {
+        None if first_seq != 1 => Err(corrupt(
+            first_seq,
+            0,
+            "leading segments are missing but no purge point explains it",
+        )),
+        None => Ok(()),
+        Some((purged, _)) => match scanner.locations.first() {
+            Some(first) if purged.checked_add(1) != Some(first.index) => Err(corrupt(
+                first.seq,
+                first.offset as usize,
+                format!(
+                    "first surviving entry {} does not follow purge point {purged}",
+                    first.index
+                ),
+            )),
+            _ => Ok(()),
+        },
+    }
+}
+
 /// Rebuilds the logical log from the segments in `io`.
 pub fn recover(io: &mut dyn SegmentIo, cfg: &WalConfig) -> Result<RecoveredLog, WalError> {
     let mut seqs = io.list_segments()?;
@@ -347,6 +372,7 @@ pub fn recover(io: &mut dyn SegmentIo, cfg: &WalConfig) -> Result<RecoveredLog, 
         };
         tail_offset = scanner.scan(seq, &image, is_last)?;
         if is_last {
+            validate_log_start(&scanner, seqs[0])?;
             // Everything past the last valid record must be zero before any append, otherwise a
             // stale valid-looking record could be resurrected later (T-03-18).
             let torn = image[tail_offset..].iter().filter(|b| **b != 0).count() as u64;
@@ -839,6 +865,82 @@ mod tests {
         assert_eq!(indices(&got), (1..=9).collect::<Vec<_>>());
         assert_eq!(got.torn_bytes_discarded, 5);
         assert_eq!(io.len(2).unwrap(), SEG);
+    }
+
+    #[test]
+    fn missing_leading_segment_without_a_purge_point_is_corrupt() {
+        let mut b = LogBuilder::new(SEG);
+        for i in 1..=3 {
+            b.segment(i, PreambleState::default());
+            b.entry(i, b"x");
+        }
+        b.sync();
+        let mut io = b.io.clone();
+        io.delete_segment(1).unwrap();
+        io.sync_dir().unwrap();
+        assert!(matches!(
+            recover(&mut io, &b.cfg()),
+            Err(WalError::Corrupt { seq: 2, .. })
+        ));
+    }
+
+    #[test]
+    fn purge_marker_after_entries_may_cover_a_deleted_segment() {
+        // The preamble predates the purge: it names point 1 and entry 3 does not follow it yet. A
+        // later marker (purge through 2, which deleted the older segments) catches the state up,
+        // so only the final state may be checked against the first surviving entry.
+        let mut b = LogBuilder::new(SEG);
+        b.segment(
+            3,
+            PreambleState { purged: Some((1, b"P1".to_vec())), vote: None, committed: None },
+        );
+        b.entry(3, b"x");
+        b.purge(2, b"P2");
+        b.sync();
+        let got = recover(&mut b.io.clone(), &b.cfg()).unwrap();
+        assert_eq!(indices(&got), vec![3]);
+        assert_eq!(got.start.state.purged, Some((2, b"P2".to_vec())));
+    }
+
+    #[test]
+    fn first_entry_must_follow_the_purge_point() {
+        // The purge point says 1..=2 are gone, but the log resumes at 4: entry 3 was lost.
+        let mut b = LogBuilder::new(SEG);
+        b.segment(
+            3,
+            PreambleState { purged: Some((2, b"P2".to_vec())), vote: None, committed: None },
+        );
+        b.entry(4, b"x");
+        b.entry(5, b"x");
+        b.sync();
+        assert!(matches!(
+            recover(&mut b.io.clone(), &b.cfg()),
+            Err(WalError::Corrupt { seq: 1, .. })
+        ));
+
+        // Same hole after a purge marker emptied the live log mid-segment.
+        let mut b = LogBuilder::new(SEG);
+        b.segment(1, PreambleState::default());
+        b.entry(1, b"x");
+        b.entry(2, b"x");
+        b.purge(2, b"P2");
+        b.entry(4, b"x");
+        b.sync();
+        assert!(matches!(
+            recover(&mut b.io.clone(), &b.cfg()),
+            Err(WalError::Corrupt { seq: 1, .. })
+        ));
+
+        // Resuming exactly after the purge point is fine.
+        let mut b = LogBuilder::new(SEG);
+        b.segment(1, PreambleState::default());
+        b.entry(1, b"x");
+        b.entry(2, b"x");
+        b.purge(2, b"P2");
+        b.entry(3, b"x");
+        b.sync();
+        let got = recover(&mut b.io.clone(), &b.cfg()).unwrap();
+        assert_eq!(indices(&got), vec![3]);
     }
 
     #[test]
