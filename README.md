@@ -109,14 +109,39 @@ cargo check
 # 2. Run local unit and integration tests
 cargo test
 
-# 3. Launch a standalone local Lightcycle node
+# 3. Launch a standalone local Lightcycle node (a one-member cluster; it initializes itself)
+#    State lives in ./lightcycle-data/node-<id> unless --data-dir is given.
 cargo run -- --node-id 1 --bind 127.0.0.1:7443
 
-# 4. Launch a 3-node local Raft cluster
-cargo run -- --node-id 1 --bind 127.0.0.1:7441 --peers "2=127.0.0.1:7442,3=127.0.0.1:7443" &
+# 4. Launch a 3-node local Raft cluster (use fresh data directories, not the one from step 3)
+#    Node 1 is the designated bootstrap node: --bootstrap makes it run initialize, once, with
+#    the full membership. Restarting it later never re-initializes. Nodes 2 and 3 do not bootstrap.
+cargo run -- --node-id 1 --bind 127.0.0.1:7441 --peers "2=127.0.0.1:7442,3=127.0.0.1:7443" --bootstrap &
 cargo run -- --node-id 2 --bind 127.0.0.1:7442 --peers "1=127.0.0.1:7441,3=127.0.0.1:7443" &
 cargo run -- --node-id 3 --bind 127.0.0.1:7443 --peers "1=127.0.0.1:7441,2=127.0.0.1:7442"
 ```
+
+Other flags: `--data-dir <path>`, `--cluster-id <n>` (default 1; nodes with different values
+refuse each other), `--fsync always|periodic|never` (default `always`) and
+`--snapshot-every <entries>` (default 1000000). The binary prints `[Lightcycle] node <id> is leader
+(term <t>)` when the node wins an election and shuts down cleanly on Ctrl-C or SIGTERM.
+
+### Raft port security (Phase 3)
+
+The Raft peer port (`--bind`) is **plaintext and unauthenticated**. This is a deliberate Phase 3
+decision (D-08): TLS/mTLS and peer authentication are deferred to a later hardening phase. Any host
+that can reach the port can inject Raft RPCs and take over the cluster, so bind it to a private
+interface (or firewall it to the cluster members) and never expose it to an untrusted network.
+Each peer relationship uses up to three TCP connections to that port (replication, heartbeat and
+snapshot lanes), so allow all of them.
+
+* The CRC32C checksums on frames and WAL records detect corruption. They are **not** authentication.
+* WAL segments and snapshot files are plaintext on disk (directories are created `0700`, files `0600`).
+* `--fsync periodic` and `--fsync never` can lose acknowledged writes on power failure. They are
+  **unsafe** and exist for benchmarking only; the node logs a warning when either is used.
+* Hardware validation of NFR-1 and NFR-2 (WAL fsync latency and throughput on Linux NVMe) is still
+  **pending**. The performance targets above are targets, and no latency claim is made yet for the
+  replicated write path.
 
 ---
 
