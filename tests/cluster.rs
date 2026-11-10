@@ -97,3 +97,83 @@ async fn engine_accessor_is_not_captured_at_start() {
 
     node.shutdown().await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn bootstrap_if_needed_is_idempotent() {
+    // Designated node: first call initializes, second is a no-op.
+    let dir = tempfile::tempdir().unwrap();
+    let node = start(bootstrap_cfg(dir.path())).await;
+    assert!(node.bootstrap_if_needed(members()).await.unwrap());
+    assert!(!node.bootstrap_if_needed(members()).await.unwrap());
+    wait_for_leader(&[&node], WAIT).await;
+    assert!(!node.bootstrap_if_needed(members()).await.unwrap());
+    node.shutdown().await.unwrap();
+
+    // Not the designated node: never initializes, and stays uninitialized.
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = fast_config(1, dir.path());
+    cfg.bootstrap = false;
+    let node = start(cfg).await;
+    assert!(!node.bootstrap_if_needed(members()).await.unwrap());
+    assert!(!node.raft().is_initialized().await.unwrap(), "non-bootstrap node must not initialize");
+    node.shutdown().await.unwrap();
+}
+
+/// Lowest WAL segment sequence present in the node's WAL directory.
+fn lowest_segment(cfg: &NodeConfig) -> u64 {
+    std::fs::read_dir(cfg.wal_dir())
+        .unwrap()
+        .filter_map(|e| {
+            lightcycle::wal::segment::parse_segment_name(&e.unwrap().file_name().to_string_lossy())
+        })
+        .min()
+        .expect("at least one wal segment")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn single_node_snapshot_purge_restart() {
+    const KEYS: usize = 400;
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = bootstrap_cfg(dir.path());
+    cfg.snapshot_every_entries = 50;
+    cfg.max_in_snapshot_log_to_keep = 10;
+    cfg.purge_batch_size = 10;
+    cfg.wal.segment_size = 4096;
+
+    let node = start(cfg.clone()).await;
+    assert!(node.bootstrap_if_needed(members()).await.unwrap());
+    wait_for_leader(&[&node], WAIT).await;
+    assert_eq!(lowest_segment(&cfg), 1);
+
+    for i in 0..KEYS {
+        let resp = node.write(set(&format!("key-{i:04}"), &format!("val-{i:04}"))).await.unwrap();
+        assert_eq!(resp, KvResponse::Ok);
+    }
+
+    // snapshot trigger -> durable snapshot -> openraft purge -> WAL purge marker -> segment delete
+    eventually(Duration::from_secs(30), "snapshot built and old WAL segments deleted", || {
+        let snap_index = node.metrics().snapshot.map(|l| l.index);
+        let low = lowest_segment(&cfg);
+        async move { snap_index.is_some_and(|i| i >= 50) && low > 1 }
+    })
+    .await;
+    let m = node.metrics();
+    assert!(m.purged.is_some(), "openraft purged the log: {m:?}");
+    node.shutdown().await.unwrap();
+
+    // Restart from snapshot plus the remaining log; stamped replay skips already-applied entries.
+    let node = start(cfg.clone()).await;
+    assert!(!node.bootstrap_if_needed(members()).await.unwrap());
+    wait_for_leader(&[&node], WAIT).await;
+    expect_value(&node, &format!("key-{:04}", KEYS - 1), &format!("val-{:04}", KEYS - 1)).await;
+    for i in 0..KEYS {
+        assert_eq!(
+            node.engine().get(format!("key-{i:04}").as_bytes()).as_deref(),
+            Some(format!("val-{i:04}").as_bytes()),
+            "key {i} lost across snapshot + purge + restart"
+        );
+    }
+    assert_eq!(node.write(set("after", "restart")).await.unwrap(), KvResponse::Ok);
+    expect_value(&node, "after", "restart").await;
+    node.shutdown().await.unwrap();
+}

@@ -7,7 +7,7 @@
 //! explicit, idempotent [`RaftNode::bootstrap_if_needed`], because re-initializing a restarted
 //! node is an error (threat T-03-32).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::sync::Arc;
 
@@ -196,6 +196,31 @@ impl RaftNode {
             Ok(resp) => Ok(resp.data),
             Err(e) => Err(map_write_error(e)),
         }
+    }
+
+    /// Add `id` at `addr` as a learner and wait for it to catch up.
+    pub async fn add_learner(&self, id: u64, addr: impl Into<String>) -> Result<(), NodeError> {
+        self.raft
+            .add_learner(id, BasicNode { addr: addr.into() }, true)
+            .await
+            .map(|_| ())
+            .map_err(map_write_error)
+    }
+
+    /// Change the voter set to `voters`. With `retain`, removed voters stay as learners;
+    /// without it they are dropped from the cluster.
+    pub async fn change_membership(
+        &self,
+        voters: BTreeSet<u64>,
+        retain: bool,
+    ) -> Result<(), NodeError> {
+        self.raft.change_membership(voters, retain).await.map(|_| ()).map_err(map_write_error)
+    }
+
+    /// Remove `ids` from the voter set and from the cluster (`retain = false`).
+    pub async fn remove_voters(&self, ids: &BTreeSet<u64>) -> Result<(), NodeError> {
+        let remaining: BTreeSet<u64> = self.raft.voter_ids().filter(|v| !ids.contains(v)).collect();
+        self.change_membership(remaining, false).await
     }
 
     /// Stop the Raft core. The core drops the WAL log store, which drains and joins the writer.
