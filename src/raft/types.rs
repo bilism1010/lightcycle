@@ -43,9 +43,25 @@ impl KvRequest {
     }
 }
 
+/// Names the variant and the sizes only. openraft formats entries and requests through `Display`
+/// in debug and trace logs and in error messages; keys and values (possibly secrets, up to
+/// megabytes each) must not be copied into them. Use `Debug` when the content is wanted.
 impl std::fmt::Display for KvRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}", self)
+        let len = |b: &Option<Bytes>| b.as_ref().map(|b| b.len());
+        match self {
+            KvRequest::Set { key, value } => {
+                write!(f, "Set(key: {} bytes, value: {} bytes)", key.len(), value.len())
+            }
+            KvRequest::Delete { key } => write!(f, "Delete(key: {} bytes)", key.len()),
+            KvRequest::Cas { key, expected, desired } => write!(
+                f,
+                "Cas(key: {} bytes, expected: {:?} bytes, desired: {:?} bytes)",
+                key.len(),
+                len(expected),
+                len(desired)
+            ),
+        }
     }
 }
 
@@ -101,6 +117,24 @@ mod tests {
             let dec: KvRequest = postcard::from_bytes(&enc).unwrap();
             assert_eq!(c, dec);
         }
+    }
+
+    #[test]
+    fn display_shows_sizes_never_contents() {
+        let secret = Bytes::from_static(b"hunter2-secret");
+        for req in [
+            KvRequest::Set { key: secret.clone(), value: secret.clone() },
+            KvRequest::Delete { key: secret.clone() },
+            KvRequest::Cas { key: secret.clone(), expected: Some(secret.clone()), desired: None },
+        ] {
+            let shown = req.to_string();
+            assert!(!shown.contains("hunter2"), "{shown}");
+            assert!(shown.contains("14 bytes"), "{shown}");
+        }
+        assert_eq!(
+            KvRequest::Set { key: b("k"), value: b("vv") }.to_string(),
+            "Set(key: 1 bytes, value: 2 bytes)"
+        );
     }
 
     #[test]
