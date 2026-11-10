@@ -5,8 +5,10 @@
 
 pub mod format;
 pub mod reader;
+pub mod store;
 pub mod writer;
 
 pub use format::{Meta, SnapshotError};
 pub use reader::{load_snapshot, read_header, validate_file};
+pub use store::{SnapshotStore, Stage};
 pub use writer::build_snapshot_file;
