@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -47,6 +48,12 @@ pub struct Config {
     #[arg(short, long, default_value = "127.0.0.1:7443")]
     pub bind: String,
 
+    /// Address other nodes use to reach this one, published in the cluster membership when this
+    /// node bootstraps a cluster. Defaults to the bound address, which must then not be a
+    /// wildcard (`0.0.0.0`, `[::]`): a wildcard is not routable from other hosts.
+    #[arg(long)]
+    pub advertise: Option<String>,
+
     /// Static peer list as comma-separated id=addr pairs, e.g. "2=127.0.0.1:7444,3=127.0.0.1:7445"
     /// (see lightcycle::raft::config::parse_peers).
     #[arg(long, default_value = "")]
@@ -81,6 +88,37 @@ impl Config {
             .clone()
             .unwrap_or_else(|| PathBuf::from(format!("./lightcycle-data/node-{}", self.node_id)))
     }
+}
+
+/// The address this node publishes into the cluster membership.
+///
+/// An explicit `advertise` wins (a port of 0 takes the real bound port); otherwise the bound
+/// address is used. A wildcard IP is never advertised: peers would dial it as their own loopback.
+fn advertised_addr(advertise: Option<&str>, local: SocketAddr) -> anyhow::Result<String> {
+    let Some(advertise) = advertise else {
+        anyhow::ensure!(
+            !local.ip().is_unspecified(),
+            "cannot advertise the wildcard address {local}; pass --advertise <routable host:port>"
+        );
+        return Ok(local.to_string());
+    };
+    if let Ok(mut addr) = advertise.parse::<SocketAddr>() {
+        anyhow::ensure!(
+            !addr.ip().is_unspecified(),
+            "cannot advertise the wildcard address {addr}; pass a routable --advertise host:port"
+        );
+        if addr.port() == 0 {
+            addr.set_port(local.port());
+        }
+        return Ok(addr.to_string());
+    }
+    let (host, port) = advertise
+        .rsplit_once(':')
+        .filter(|(host, port)| !host.is_empty() && port.parse::<u16>().is_ok())
+        .context("--advertise must be host:port")?;
+    let port: u16 = port.parse().context("--advertise port")?;
+    let port = if port == 0 { local.port() } else { port };
+    Ok(format!("{host}:{port}"))
 }
 
 /// Resolve when SIGINT (ctrl-c) or, on unix, SIGTERM arrives.
@@ -150,7 +188,20 @@ async fn main() -> anyhow::Result<()> {
         .into_iter()
         .map(|(id, addr)| (id, BasicNode { addr }))
         .collect();
-    members.insert(config.node_id, BasicNode { addr: local_addr.to_string() });
+    let advertise = if bootstrap {
+        match advertised_addr(config.advertise.as_deref(), local_addr) {
+            Ok(addr) => addr,
+            Err(e) => {
+                server.shutdown().await;
+                let _ = node.shutdown().await;
+                return Err(e);
+            }
+        }
+    } else {
+        // Only the node that initializes the cluster publishes its own address.
+        local_addr.to_string()
+    };
+    members.insert(config.node_id, BasicNode { addr: advertise });
     match node.bootstrap_if_needed(members).await {
         Ok(true) => println!("[Lightcycle] node {} initialized a new cluster", config.node_id),
         Ok(false) => {}
@@ -197,4 +248,61 @@ async fn main() -> anyhow::Result<()> {
     server.shutdown().await;
     node.shutdown().await.context("raft node shutdown")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn local(addr: &str) -> SocketAddr {
+        addr.parse().unwrap()
+    }
+
+    #[test]
+    fn concrete_bound_address_is_advertised_as_is() {
+        assert_eq!(advertised_addr(None, local("10.0.0.5:7443")).unwrap(), "10.0.0.5:7443");
+    }
+
+    #[test]
+    fn wildcard_bind_without_advertise_is_refused() {
+        assert!(advertised_addr(None, local("0.0.0.0:7443")).is_err());
+        assert!(advertised_addr(None, local("[::]:7443")).is_err());
+    }
+
+    #[test]
+    fn explicit_advertise_replaces_a_wildcard_bind() {
+        assert_eq!(
+            advertised_addr(Some("10.0.0.5:7443"), local("0.0.0.0:7443")).unwrap(),
+            "10.0.0.5:7443"
+        );
+        assert_eq!(
+            advertised_addr(Some("hostb.internal:7443"), local("0.0.0.0:7443")).unwrap(),
+            "hostb.internal:7443"
+        );
+    }
+
+    #[test]
+    fn wildcard_advertise_is_refused() {
+        assert!(advertised_addr(Some("0.0.0.0:7443"), local("10.0.0.5:7443")).is_err());
+        assert!(advertised_addr(Some("[::]:7443"), local("10.0.0.5:7443")).is_err());
+    }
+
+    #[test]
+    fn malformed_advertise_is_refused() {
+        assert!(advertised_addr(Some("no-port"), local("10.0.0.5:7443")).is_err());
+        assert!(advertised_addr(Some(":7443"), local("10.0.0.5:7443")).is_err());
+        assert!(advertised_addr(Some("host:notaport"), local("10.0.0.5:7443")).is_err());
+    }
+
+    #[test]
+    fn advertised_port_zero_takes_the_bound_port() {
+        assert_eq!(
+            advertised_addr(Some("10.0.0.5:0"), local("0.0.0.0:41234")).unwrap(),
+            "10.0.0.5:41234"
+        );
+        assert_eq!(
+            advertised_addr(Some("hostb:0"), local("0.0.0.0:41234")).unwrap(),
+            "hostb:41234"
+        );
+    }
 }
