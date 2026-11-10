@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::io;
 
 use super::io::SegmentIo;
-use super::record::{decode_record, Decoded, RecordType};
+use super::record::{decode_record, Decoded, RecordType, RECORD_HEADER_LEN};
 use super::segment::{
     decode_preamble, EntryLocation, PreambleState, SegmentSummary, WalConfig, WalError, WalStart,
 };
@@ -74,6 +74,17 @@ fn read_image(io: &dyn SegmentIo, seq: u64, cap: u64) -> Result<Vec<u8>, WalErro
     Ok(buf)
 }
 
+/// Whether any CRC-valid record starts at or after `from` in `image`.
+///
+/// A torn write damages only a suffix of the unsynced data, so nothing valid can follow a torn
+/// tail. A valid record after an invalid one is therefore evidence of media corruption (a bit
+/// flip or a lost or misdirected sector write) that would otherwise be mistaken for a torn tail
+/// and silently discard every acknowledged record behind it.
+fn valid_record_follows(image: &[u8], from: usize) -> bool {
+    (from..image.len().saturating_sub(RECORD_HEADER_LEN - 1))
+        .any(|p| matches!(decode_record(&image[p..]), Decoded::Record { .. }))
+}
+
 /// Running state of the scan.
 struct Scanner {
     state: PreambleState,
@@ -107,8 +118,11 @@ impl Scanner {
 
     /// Walks one segment image and returns the offset where scanning stopped.
     ///
-    /// In the last segment an invalid record is the torn tail and just ends the scan. Anywhere else
-    /// an invalid record, or data after the end marker, is mid-log corruption (T-03-17).
+    /// In the last segment an invalid record is the torn tail and just ends the scan, provided
+    /// nothing valid follows it. A valid record behind an invalid one, or behind a zero header,
+    /// means acknowledged data lies beyond the damage, so it is mid-log corruption and not a tear.
+    /// Anywhere else an invalid record, or data after the end marker, is mid-log corruption
+    /// (T-03-17).
     fn scan(&mut self, seq: u64, image: &[u8], is_last: bool) -> Result<usize, WalError> {
         let mut off = match decode_record(image) {
             Decoded::Record {
@@ -149,6 +163,16 @@ impl Scanner {
 
         loop {
             match decode_record(&image[off..]) {
+                Decoded::End | Decoded::Invalid
+                    if is_last && valid_record_follows(image, off + 1) =>
+                {
+                    return Err(corrupt(
+                        seq,
+                        off,
+                        "valid records follow an invalid record in the last segment: \
+                         corruption, not a torn tail",
+                    ));
+                }
                 Decoded::End => break,
                 Decoded::Invalid if is_last => break,
                 Decoded::Invalid => {
@@ -249,9 +273,15 @@ impl Scanner {
 
 /// Whether the last segment never received a valid preamble: all zero (crash right after
 /// creation) or a torn preamble record. A valid record of another type, or data after a zero
-/// header, is not a creation crash and is reported as corruption instead.
+/// header, is not a creation crash and is reported as corruption instead. So is a damaged
+/// preamble with valid records behind it: that segment held acknowledged data.
 fn head_is_unwritten(seq: u64, image: &[u8]) -> Result<bool, WalError> {
     match decode_record(image) {
+        Decoded::Invalid if valid_record_follows(image, 1) => Err(corrupt(
+            seq,
+            0,
+            "damaged preamble with valid records behind it",
+        )),
         Decoded::Invalid => Ok(true),
         Decoded::End => match image.iter().position(|b| *b != 0) {
             None => Ok(true),
@@ -738,6 +768,58 @@ mod tests {
             }
         }
         assert!(recover(&mut io, &b.cfg()).is_ok());
+    }
+
+    #[test]
+    fn bit_flip_in_last_segment_with_records_behind_it_is_corrupt() {
+        // Entries 4..=8 are synced behind the flipped record, so they are acknowledged data and
+        // must never be zeroed as a "torn tail".
+        let mut b = synced_base();
+        let mut flipped = Vec::new();
+        for i in 4..=8 {
+            flipped.push(b.entry(i, &BODY));
+        }
+        b.sync();
+        let mut io = b.io.clone();
+        let target = &flipped[1];
+        let pos = target.offset + RECORD_HEADER_LEN as u64 + 2;
+        let orig = io.segment_bytes(1)[pos as usize];
+        io.write_at(1, pos, &[orig ^ 0xFF]).unwrap();
+        io.sync_segment(1).unwrap();
+        let before = io.segment_bytes(1);
+        assert!(matches!(
+            recover(&mut io, &b.cfg()),
+            Err(WalError::Corrupt { seq: 1, .. })
+        ));
+        assert_eq!(io.segment_bytes(1), before, "recovery must not repair corruption");
+
+        // The same flip in the very last record is indistinguishable from a tear and is repaired.
+        io.write_at(1, pos, &[orig]).unwrap();
+        let last = &flipped[4];
+        let pos = last.offset + RECORD_HEADER_LEN as u64 + 2;
+        let orig = io.segment_bytes(1)[pos as usize];
+        io.write_at(1, pos, &[orig ^ 0xFF]).unwrap();
+        let got = recover(&mut io, &b.cfg()).unwrap();
+        assert_eq!(got.locations.len(), 7);
+        assert!(got.torn_bytes_discarded > 0);
+    }
+
+    #[test]
+    fn damaged_preamble_in_last_segment_with_records_behind_it_is_corrupt() {
+        let mut b = synced_base();
+        b.segment(4, PreambleState::default());
+        b.entry(4, &BODY);
+        b.entry(5, &BODY);
+        b.sync();
+        let mut io = b.io.clone();
+        let orig = io.segment_bytes(2)[10];
+        io.write_at(2, 10, &[orig ^ 0xFF]).unwrap();
+        io.sync_segment(2).unwrap();
+        assert!(matches!(
+            recover(&mut io, &b.cfg()),
+            Err(WalError::Corrupt { seq: 2, .. })
+        ));
+        assert_eq!(io.list_segments().unwrap(), vec![1, 2], "segment must not be deleted");
     }
 
     #[test]
