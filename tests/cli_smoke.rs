@@ -25,11 +25,16 @@ fn is_wal_name(name: &str) -> bool {
 #[test]
 fn standalone_binary_becomes_leader_and_creates_wal() {
     let dir = tempfile::tempdir().unwrap();
+    // The child's stderr goes to a file so a startup failure is reported with its cause instead
+    // of as a bare "no leader line".
+    let logs = tempfile::tempdir().unwrap();
+    let stderr_path = logs.path().join("stderr.log");
+    let stderr_text = || std::fs::read_to_string(&stderr_path).unwrap_or_default();
     let mut child = Command::new(env!("CARGO_BIN_EXE_lightcycle"))
         .args(["--node-id", "1", "--bind", "127.0.0.1:0", "--data-dir"])
         .arg(dir.path())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::from(std::fs::File::create(&stderr_path).unwrap()))
         .stdin(Stdio::null())
         .spawn()
         .expect("spawn lightcycle binary");
@@ -60,7 +65,15 @@ fn standalone_binary_becomes_leader_and_creates_wal() {
                     break;
                 }
             }
-            Err(_) => panic!("no leader line within 15 s; output so far: {seen:#?}"),
+            Err(mpsc::RecvTimeoutError::Timeout) => panic!(
+                "no leader line within 15 s; stdout so far: {seen:#?}; stderr: {}",
+                stderr_text()
+            ),
+            Err(mpsc::RecvTimeoutError::Disconnected) => panic!(
+                "the node closed its stdout (exited?) before a leader line; stdout: {seen:#?}; \
+                 stderr: {}",
+                stderr_text()
+            ),
         }
     }
     assert!(listening, "the listening line precedes the leader line: {seen:#?}");
