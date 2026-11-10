@@ -183,7 +183,13 @@ impl Fsync {
 /// Tunables for the WAL.
 #[derive(Debug, Clone)]
 pub struct WalConfig {
-    /// Size of each preallocated segment in bytes.
+    /// Size of each preallocated segment in bytes. **Treat it as a cluster-wide setting.** It
+    /// bounds the largest log entry a node's WAL accepts (see
+    /// [`max_entry_bytes`](crate::wal::store::max_entry_bytes)), and an entry the leader
+    /// accepted is replicated as is: a follower with a smaller `segment_size` would reject it
+    /// in `append`, which openraft treats as fatal for that follower, and fail the same way on
+    /// every restart. Nothing negotiates or checks this between nodes, so keep it identical on
+    /// every member (the command line offers no flag for it; only library users can differ).
     pub segment_size: u64,
     /// Fsync policy.
     pub fsync: Fsync,

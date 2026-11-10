@@ -84,6 +84,9 @@ fn estimate_size(entry: &Entry) -> usize {
 /// (`MAX_RECORD_LEN` covers the type byte and the 8-byte index prefix) and an otherwise empty
 /// segment. Entries above it are rejected before they touch any state, because the writer cannot
 /// store them.
+///
+/// The limit depends on the node's own `segment_size`, so it is only consistent across a cluster
+/// when every member uses the same `segment_size` (not enforced; see [`WalConfig::segment_size`]).
 pub fn max_entry_bytes(cfg: &WalConfig) -> usize {
     let by_record = MAX_RECORD_LEN as usize - 1 - 8;
     let segment = usize::try_from(cfg.segment_size).unwrap_or(usize::MAX);
