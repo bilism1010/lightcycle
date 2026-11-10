@@ -14,6 +14,11 @@
 //! 3. StdFsIo, `Fsync::Always`, a single op in flight.
 //!
 //! Set `LC_WAL_BENCH_OPS` to override the op count of all three scenarios for a short local run.
+//!
+//! The StdFsIo scenarios create their WAL directory under `LC_WAL_BENCH_DIR` when set, otherwise
+//! under the system temp directory. On many Linux hosts `/tmp` is tmpfs, where `fsync` is nearly
+//! free, so for a meaningful `[tail]`/`[fsync]` figure point `LC_WAL_BENCH_DIR` at the device
+//! under test. The resolved directory is printed in the `[info]` line.
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use lightcycle::wal::io::{FakeIo, SegmentIo, StdFsIo};
@@ -50,6 +55,15 @@ fn ops_override(default: usize) -> usize {
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|n| *n > 0)
         .unwrap_or(default)
+}
+
+/// Directory the StdFsIo scenarios create their WAL under: `LC_WAL_BENCH_DIR`, else the system
+/// temp directory.
+fn bench_dir() -> std::path::PathBuf {
+    std::env::var_os("LC_WAL_BENCH_DIR")
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
 }
 
 fn spawn(io: Box<dyn SegmentIo>, segment_size: u64) -> WalHandle<Vec<u8>> {
@@ -117,7 +131,7 @@ fn fsync_report(label: &str, stats: &WalStats) {
 }
 
 fn std_scenario(label: &str, ops: usize, window: usize) {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = tempfile::tempdir_in(bench_dir()).expect("create a bench dir under LC_WAL_BENCH_DIR");
     let io = StdFsIo::new(tmp.path().join("wal")).expect("open wal dir");
     let mut h = spawn(Box::new(io), 64 * 1024 * 1024);
     let lat = drive(&mut h, ops, window);
@@ -128,6 +142,10 @@ fn std_scenario(label: &str, ops: usize, window: usize) {
 
 fn append_ack_report() {
     println!("[info] INFORMATIONAL only: NFR-1 and NFR-2 are not validated by this bench");
+    println!(
+        "[info] stdfs scenarios write under {} (set LC_WAL_BENCH_DIR to change; tmpfs makes fsync free)",
+        bench_dir().display()
+    );
 
     let ops = ops_override(200_000);
     let mut h = spawn(Box::new(FakeIo::new()), 64 * 1024 * 1024);
