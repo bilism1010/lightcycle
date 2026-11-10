@@ -8,18 +8,37 @@
 #   timer granularity is ~41.7ns, so the limits are about +25%:
 #   GET_1T_MAX_NS (default 334), GET_8T_MAX_NS (default 667).
 #
+# The defaults are ABSOLUTE numbers measured on one development machine (an Apple
+# Silicon laptop; its 24 MHz counter gives the ~41.7ns granularity above). On a
+# different machine class (a Linux host with a ~1ns clock, a slower or throttled
+# CPU) they mean something else: record that host's own limits instead. Order of
+# precedence, highest first: the GET_1T_MAX_NS / GET_8T_MAX_NS environment
+# variables, a per-host baseline file (shell assignments of those two variables;
+# default scripts/get-regression.local, which .gitignore already excludes, or the
+# path in GET_BASELINE_FILE), then the defaults.
+#
 # Tail latency on a shared machine is noisy: up to ATTEMPTS (default 3) runs
-# are made and the guard passes if any one attempt is within both limits.
+# are made and the guard passes if any one attempt is within both limits. The
+# best-of-N policy can hide a regression that is only intermittently slow; the
+# output names the attempt that passed so a host that needs retries is visible.
 #
 # `nomatch_filter` matches no Criterion benchmark, so only the explicit tail
 # report runs (about 2 seconds after the build).
 set -euo pipefail
 
-GET_1T_MAX_NS="${GET_1T_MAX_NS:-334}"
-GET_8T_MAX_NS="${GET_8T_MAX_NS:-667}"
-ATTEMPTS="${ATTEMPTS:-3}"
+cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 2
 
-cd "$(dirname "${BASH_SOURCE[0]}")/.."
+env_1t="${GET_1T_MAX_NS:-}"
+env_8t="${GET_8T_MAX_NS:-}"
+baseline_file="${GET_BASELINE_FILE:-scripts/get-regression.local}"
+if [[ -f "$baseline_file" ]]; then
+  # shellcheck disable=SC1090
+  . "$baseline_file"
+  echo "using per-host limits from $baseline_file"
+fi
+GET_1T_MAX_NS="${env_1t:-${GET_1T_MAX_NS:-334}}"
+GET_8T_MAX_NS="${env_8t:-${GET_8T_MAX_NS:-667}}"
+ATTEMPTS="${ATTEMPTS:-3}"
 
 extract_p99() {
   # $1 = report text, $2 = label prefix, e.g. "GET 1 thread"
@@ -45,7 +64,7 @@ for attempt in $(seq 1 "$ATTEMPTS"); do
   fi
   echo "attempt $attempt: GET 1 thread p99=${p99_1t}ns (max ${GET_1T_MAX_NS}), GET 8 threads p99=${p99_8t}ns (max ${GET_8T_MAX_NS})"
   if (( p99_1t <= GET_1T_MAX_NS && p99_8t <= GET_8T_MAX_NS )); then
-    echo "PASS: GET tail latency within limits"
+    echo "PASS: GET tail latency within limits (attempt $attempt of $ATTEMPTS)"
     exit 0
   fi
 done
