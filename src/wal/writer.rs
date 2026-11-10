@@ -649,6 +649,10 @@ impl<P: WalPayload> Writer<P> {
         if self.sync_enabled() {
             self.sync_active()?;
         }
+        // The marker is durable, so the in-memory index and cache may forget the purged entries
+        // now. Doing it before the unlinks means a reader that loses the race finds the index
+        // entry gone (a clean "not found") instead of a deleted file behind a live location.
+        self.observer.on_purge(upto);
         let victims: Vec<u64> = self
             .segs
             .iter()
@@ -664,7 +668,6 @@ impl<P: WalPayload> Writer<P> {
         if !victims.is_empty() && self.sync_enabled() {
             self.io.sync_dir()?;
         }
-        self.observer.on_purge(upto);
         Ok(())
     }
 }
@@ -1076,6 +1079,41 @@ mod tests {
         assert_eq!(recs[6].payload, [vec![1u8], 2u64.to_le_bytes().to_vec()].concat());
         assert_eq!(entry_index(&recs[7]), 3);
         assert_eq!(&recs[7].payload[8..], &body(99, 41)[..]);
+    }
+
+    #[test]
+    fn purge_is_reported_to_the_observer_before_segments_are_deleted() {
+        struct SegmentsAtPurge {
+            io: FakeIo,
+            seen: Arc<parking_lot::Mutex<Option<Vec<u64>>>>,
+        }
+        impl WalObserver for SegmentsAtPurge {
+            fn on_entries_written(&mut self, _locs: &[EntryLocation]) {}
+            fn on_truncate(&mut self, _keep_through: Option<u64>) {}
+            fn on_purge(&mut self, _upto: u64) {
+                *self.seen.lock() = Some(SegmentIo::list_segments(&self.io).unwrap());
+            }
+            fn on_flushed(&mut self, _upto_index: u64) {}
+        }
+
+        let io = FakeIo::new();
+        let seen = Arc::new(parking_lot::Mutex::new(None));
+        let obs = SegmentsAtPurge { io: io.clone(), seen: Arc::clone(&seen) };
+        let mut h = WalHandle::<Vec<u8>>::spawn(
+            Box::new(io.clone()),
+            cfg(4096),
+            WalStart::fresh(),
+            Box::new(obs),
+        )
+        .unwrap();
+        fill(&mut h, 1, 150, 100);
+        let segs = segments(&io);
+        let upto = *seg_entries(&io.segment_bytes(segs[1])).last().unwrap();
+        op_wait(&mut h, |ack| WalOp::Purge { upto, blob: b"p".to_vec(), ack }).unwrap();
+        h.shutdown();
+
+        assert_eq!(seen.lock().clone(), Some(segs.clone()), "observer ran after the deletes");
+        assert_eq!(segments(&io), segs[2..].to_vec());
     }
 
     #[test]
