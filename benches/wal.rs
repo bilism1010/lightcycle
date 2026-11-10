@@ -27,7 +27,7 @@
 //! free, so for a meaningful `[tail]`/`[fsync]` figure point `LC_WAL_BENCH_DIR` at the device
 //! under test. The resolved directory is printed in the `[info]` line.
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion};
 use lightcycle::wal::io::{FakeIo, SegmentIo, StdFsIo};
 use lightcycle::wal::writer::{Ack, WalHandle, WalOp, WalStats};
 use lightcycle::wal::{Fsync, NoopObserver, WalConfig, WalStart};
@@ -42,15 +42,26 @@ fn percentile(sorted: &[u64], p: f64) -> u64 {
     sorted[idx.saturating_sub(1).min(sorted.len() - 1)]
 }
 
+/// Prints the tail of `lat` (append-to-ack latencies in submission order) and returns p99.
+///
+/// The first 1% of samples is dropped as warm-up (first segment creation, writer thread start,
+/// page faults), and `p99.9` is printed only from 1000 samples on: at n=300, p99.9 is the maximum
+/// and p99 the third-largest sample, which says little.
 fn tail_report(label: &str, mut lat: Vec<u64>) -> u64 {
+    let warmup = lat.len() / 100;
+    lat.drain(..warmup);
     lat.sort_unstable();
     let p99 = percentile(&lat, 0.99);
+    let p999 = if lat.len() >= 1000 {
+        format!("{:>10}ns", percentile(&lat, 0.999))
+    } else {
+        format!("{:>12}", "n/a (n<1000)")
+    };
     println!(
-        "[tail] {label:<34} n={:<8} p50={:>9}ns p99={:>10}ns p99.9={:>10}ns max={:>11}ns",
+        "[tail] {label:<34} n={:<8} p50={:>9}ns p99={:>10}ns p99.9={p999} max={:>11}ns",
         lat.len(),
         percentile(&lat, 0.50),
         p99,
-        percentile(&lat, 0.999),
         lat[lat.len() - 1]
     );
     p99
@@ -86,16 +97,21 @@ fn spawn(io: Box<dyn SegmentIo>, segment_size: u64) -> WalHandle<Vec<u8>> {
 /// latency of every op in nanoseconds.
 fn drive(h: &mut WalHandle<Vec<u8>>, ops: usize, window: usize) -> Vec<u64> {
     let slots: Arc<Vec<AtomicU64>> = Arc::new((0..ops).map(|_| AtomicU64::new(0)).collect());
+    // Start stamps are taken right before the first submit attempt, after the payload and the ack
+    // box exist, so allocator cost is not counted as append-to-ack latency.
+    let starts: Arc<Vec<AtomicU64>> = Arc::new((0..ops).map(|_| AtomicU64::new(0)).collect());
     let inflight = Arc::new(AtomicUsize::new(0));
+    let base = Instant::now();
     for i in 0..ops {
         while inflight.load(Ordering::Acquire) >= window {
             std::thread::yield_now();
         }
         inflight.fetch_add(1, Ordering::AcqRel);
-        let started = Instant::now();
-        let (slots, inflight) = (Arc::clone(&slots), Arc::clone(&inflight));
+        let (slots, ack_starts, inflight) =
+            (Arc::clone(&slots), Arc::clone(&starts), Arc::clone(&inflight));
         let ack: Ack = Box::new(move |result| {
-            let ns = started.elapsed().as_nanos() as u64;
+            let end = base.elapsed().as_nanos() as u64;
+            let ns = end.saturating_sub(ack_starts[i].load(Ordering::Acquire));
             slots[i].store(if result.is_ok() { ns.max(1) } else { u64::MAX }, Ordering::Release);
             inflight.fetch_sub(1, Ordering::AcqRel);
         });
@@ -104,6 +120,7 @@ fn drive(h: &mut WalHandle<Vec<u8>>, ops: usize, window: usize) -> Vec<u64> {
             payload: vec![0xA5u8; PAYLOAD_LEN],
             ack: Some(ack),
         };
+        starts[i].store(base.elapsed().as_nanos() as u64, Ordering::Release);
         loop {
             match h.try_submit(op) {
                 Ok(()) => break,
@@ -186,30 +203,38 @@ fn bench_wal(c: &mut Criterion) {
     let mut h = spawn(Box::new(FakeIo::new()), 4 * 1024 * 1024);
     let mut next = 1u64;
     g.bench_function("fakeio_round_trip", |b| {
-        b.iter(|| {
-            let (tx, rx) = std::sync::mpsc::channel();
-            let ack: Ack = Box::new(move |r| {
-                let _ = tx.send(r);
-            });
-            let mut op = WalOp::Entry {
-                index: next,
-                payload: vec![0xA5u8; PAYLOAD_LEN],
-                ack: Some(ack),
-            };
-            next += 1;
-            loop {
-                match h.try_submit(op) {
-                    Ok(()) => break,
-                    Err(back) => {
-                        op = back;
-                        std::thread::yield_now();
+        // The payload, the ack channel and the op are built in the untimed setup; the timed
+        // routine is the submit and the wait for the ack.
+        b.iter_batched(
+            || {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let ack: Ack = Box::new(move |r| {
+                    let _ = tx.send(r);
+                });
+                let op = WalOp::Entry {
+                    index: next,
+                    payload: vec![0xA5u8; PAYLOAD_LEN],
+                    ack: Some(ack),
+                };
+                next += 1;
+                (op, rx)
+            },
+            |(mut op, rx)| {
+                loop {
+                    match h.try_submit(op) {
+                        Ok(()) => break,
+                        Err(back) => {
+                            op = back;
+                            std::thread::yield_now();
+                        }
                     }
                 }
-            }
-            let result = rx.recv().expect("ack");
-            assert!(result.is_ok(), "append failed; the round-trip figure is not meaningful");
-            black_box(result)
-        })
+                let result = rx.recv().expect("ack");
+                assert!(result.is_ok(), "append failed; the round-trip figure is not meaningful");
+                black_box(result)
+            },
+            BatchSize::SmallInput,
+        )
     });
     g.finish();
     h.shutdown();
