@@ -358,3 +358,258 @@ async fn kill_restart_keeps_committed_writes() {
     cluster.assert_contain_and_identical(&[1, 2, 3], &acked).await;
     eprintln!("torn bytes discarded: follower {first:?}, ex-leader {second:?}");
 }
+
+// ---------------------------------------------------------------------------------------------
+// Dynamic membership (plan 03-16).
+// ---------------------------------------------------------------------------------------------
+
+use common::{dump, MembershipLog};
+use std::collections::BTreeSet;
+
+fn set_of(ids: &[u64]) -> BTreeSet<u64> {
+    ids.iter().copied().collect()
+}
+
+/// Start node `id` outside the membership, add it as a learner (blocking until caught up), then
+/// promote it to a voter alongside `current`. Returns the new voter list.
+async fn grow(cluster: &mut TestCluster, current: &[u64], id: u64, log: &MembershipLog) -> Vec<u64> {
+    cluster.start_extra(id).await;
+    log.watch(cluster.node(id));
+    cluster.add_learner(current, id).await.expect("add learner");
+    let mut next = current.to_vec();
+    next.push(id);
+    cluster.change_membership(current, &set_of(&next), false).await.expect("promote learner");
+    next
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn membership_add_voter() {
+    let mut cluster = TestCluster::start(3, ClusterOpts::default()).await;
+    let log = MembershipLog::new();
+    for id in 1..=3 {
+        log.watch(cluster.node(id));
+    }
+    cluster.leader().await;
+    write_keys(&cluster, "a", 0..20).await;
+    let mut expected = expect_map("a", 0..20);
+    cluster.wait_converged(&[1, 2, 3], &expected).await;
+
+    // Learner first: it catches up on the 20 keys before it may vote.
+    cluster.start_extra(4).await;
+    log.watch(cluster.node(4));
+    cluster.add_learner(&[1, 2, 3], 4).await.expect("add learner 4");
+    cluster.wait_converged(&[4], &expected).await;
+    assert!(
+        !cluster.node(4).metrics().membership_config.voter_ids().any(|v| v == 4),
+        "node 4 is a learner, not yet a voter"
+    );
+
+    cluster.change_membership(&[1, 2, 3], &set_of(&[1, 2, 3, 4]), false).await.expect("change");
+    cluster.wait_voters(&[1, 2, 3, 4], &set_of(&[1, 2, 3, 4])).await;
+
+    write_keys(&cluster, "b", 0..20).await;
+    expected.extend(expect_map("b", 0..20));
+    cluster.wait_converged(&[1, 2, 3, 4], &expected).await;
+
+    // Adding one voter to {1,2,3}: old and new quorums intersect, so openraft takes the
+    // single-step path and no joint configuration is ever written.
+    assert!(!log.saw_joint(), "unexpected joint configuration: {:?}", log.configs());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn membership_remove_voter() {
+    let mut cluster = TestCluster::start(3, ClusterOpts::default()).await;
+    let log = MembershipLog::new();
+    for id in 1..=3 {
+        log.watch(cluster.node(id));
+    }
+    cluster.leader().await;
+    write_keys(&cluster, "a", 0..20).await;
+    let voters = grow(&mut cluster, &[1, 2, 3], 4, &log).await;
+    cluster.wait_voters(&voters, &set_of(&voters)).await;
+    let mut expected = expect_map("a", 0..20);
+    cluster.wait_converged(&voters, &expected).await;
+
+    // Remove a follower (never the leader here).
+    let leader = cluster.leader().await;
+    let removed = *voters.iter().find(|id| **id != leader).unwrap();
+    let remaining: Vec<u64> = voters.iter().copied().filter(|id| *id != removed).collect();
+    cluster.remove_voters(&voters, &set_of(&[removed])).await.expect("remove voter");
+    cluster.wait_voters(&remaining, &set_of(&remaining)).await;
+    for id in &remaining {
+        let m = cluster.node(*id).metrics();
+        assert!(
+            !m.membership_config.nodes().any(|(n, _)| *n == removed),
+            "node {id} still lists removed node {removed}: {}",
+            m.membership_config
+        );
+    }
+
+    // The remaining three keep committing; the removed node stops receiving writes.
+    write_keys_among(&cluster, &remaining, "b", 0..20).await;
+    let before_removal = expected.clone();
+    expected.extend(expect_map("b", 0..20));
+    cluster.wait_converged(&remaining, &expected).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        dump(&cluster.node(removed).engine()),
+        before_removal,
+        "the removed node must not see writes made after its removal"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn membership_replace_voters_joint() {
+    let mut cluster = TestCluster::start(3, ClusterOpts::default()).await;
+    let log = MembershipLog::new();
+    for id in 1..=3 {
+        log.watch(cluster.node(id));
+    }
+    cluster.leader().await;
+    write_keys(&cluster, "a", 0..20).await;
+    let mut acked = expect_map("a", 0..20);
+    cluster.wait_converged(&[1, 2, 3], &acked).await;
+
+    // Both new nodes join as learners first, so catch-up is not what the change waits for.
+    for id in [4, 5] {
+        cluster.start_extra(id).await;
+        log.watch(cluster.node(id));
+        cluster.add_learner(&[1, 2, 3], id).await.expect("add learner");
+    }
+
+    // {1,2,3} -> {3,4,5}: the old quorum {1,2} and the new quorum {4,5} do not intersect.
+    let writer = cluster.spawn_writer("bg");
+    writer.wait_acked(5).await;
+    cluster.change_membership(&[1, 2, 3], &set_of(&[3, 4, 5]), false).await.expect("replace");
+    let final_voters = [3u64, 4, 5];
+    cluster.wait_voters(&final_voters, &set_of(&final_voters)).await;
+    let progress = writer.acked();
+    writer.wait_acked(progress + 5).await; // writable through the new voters
+    acked.extend(writer.stop().await);
+
+    let joint = log.configs().into_iter().find(|(_, c)| c.len() > 1);
+    assert!(
+        joint.is_some(),
+        "no joint configuration observed replacing {{1,2,3}} with {{3,4,5}}; recorded: {:?}",
+        log.configs()
+    );
+    let (_, joint_cfg) = joint.unwrap();
+    assert!(
+        joint_cfg.contains(&set_of(&[1, 2, 3])) && joint_cfg.contains(&set_of(&[3, 4, 5])),
+        "joint configuration names the wrong voter sets: {joint_cfg:?}"
+    );
+
+    write_keys_among(&cluster, &final_voters, "c", 0..20).await;
+    acked.extend(expect_map("c", 0..20));
+    cluster.assert_contain_and_identical(&final_voters, &acked).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn membership_remove_leader_new_leader_elected() {
+    let mut cluster = TestCluster::start(3, ClusterOpts::default()).await;
+    let log = MembershipLog::new();
+    for id in 1..=3 {
+        log.watch(cluster.node(id));
+    }
+    cluster.leader().await;
+    write_keys(&cluster, "a", 0..20).await;
+    let voters = grow(&mut cluster, &[1, 2, 3], 4, &log).await;
+    cluster.wait_voters(&voters, &set_of(&voters)).await;
+    let mut acked = expect_map("a", 0..20);
+    cluster.wait_converged(&voters, &acked).await;
+
+    let old_leader = cluster.leader().await;
+    let remaining: Vec<u64> = voters.iter().copied().filter(|id| *id != old_leader).collect();
+    let writer = cluster.spawn_writer("bg");
+    writer.wait_acked(5).await;
+    cluster.remove_voters(&voters, &set_of(&[old_leader])).await.expect("remove leader");
+
+    // A new leader among the remaining voters is elected and accepts writes.
+    let new_leader = tokio::time::timeout(Duration::from_secs(15), cluster.leader_among(&remaining))
+        .await
+        .expect("a new leader within 15 s of removing the old one");
+    assert_ne!(new_leader, old_leader);
+    assert!(remaining.contains(&new_leader));
+    let progress = writer.acked();
+    writer.wait_acked(progress + 5).await;
+    acked.extend(writer.stop().await);
+    write_keys_among(&cluster, &remaining, "c", 0..20).await;
+    acked.extend(expect_map("c", 0..20));
+
+    cluster.wait_voters(&remaining, &set_of(&remaining)).await;
+    cluster.assert_contain_and_identical(&remaining, &acked).await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Snapshot catch-up after log purge (plan 03-16).
+// ---------------------------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn kill_restart_snapshot_catchup() {
+    let opts = ClusterOpts {
+        use_fake_io: false,
+        snapshot_every: 50,
+        segment_size: 4096,
+        max_in_snapshot_log_to_keep: 10,
+        purge_batch_size: 10,
+    };
+    let mut cluster = TestCluster::start(3, opts).await;
+    let leader = cluster.leader().await;
+    // Lag a follower and restart the other one, so the leader is never the one taken out.
+    let mut followers = (1..=3u64).filter(|id| *id != leader);
+    let lagging = followers.next().unwrap();
+    let restarted = followers.next().unwrap();
+    let up = [leader, restarted];
+
+    write_keys(&cluster, "base", 0..5).await;
+    let base = expect_map("base", 0..5);
+    cluster.wait_converged(&[1, 2, 3], &base).await;
+
+    // Isolate the lagging follower and hold on to its engine as of now.
+    cluster.ctl.isolate(lagging);
+    let before = cluster.node(lagging).engine();
+    let lagging_last_log = cluster.node(lagging).metrics().last_log_index.expect("has a log");
+
+    write_keys_among(&cluster, &up, "s", 0..300).await;
+    let mut expected = base.clone();
+    expected.extend(expect_map("s", 0..300));
+    cluster.wait_converged(&up, &expected).await;
+
+    // The leader snapshots and purges its log past everything the lagging follower has.
+    eventually(Duration::from_secs(30), "leader snapshot at index >= 50 and log purged past the lagging follower", || {
+        let m = cluster.node(leader).metrics();
+        let snap = m.snapshot.map(|l| l.index);
+        let purged = m.purged.map(|l| l.index);
+        async move { snap.is_some_and(|i| i >= 50) && purged.is_some_and(|p| p > lagging_last_log) }
+    })
+    .await;
+
+    // Graceful kill and restart of the other follower: it recovers from its own snapshot plus
+    // log and the pair {leader, restarted} keeps committing while the third node is still cut off.
+    cluster.kill(restarted).await;
+    cluster.restart(restarted).await;
+    write_keys_among(&cluster, &up, "t", 0..20).await;
+    expected.extend(expect_map("t", 0..20));
+    cluster.wait_converged(&up, &expected).await;
+
+    // Heal: the lagging follower can only catch up from a snapshot because the log is purged.
+    cluster.ctl.heal();
+    cluster.wait_converged(&[lagging], &expected).await; // fresh engine() on every poll
+    let after = cluster.node(lagging).engine();
+    assert!(
+        !Arc::ptr_eq(&before, &after),
+        "engine() must follow the install_snapshot swap: the handle is still the pre-heal engine"
+    );
+    assert_eq!(dump(&before), base, "the pre-heal engine handle must not have gained the new keys");
+
+    let stats = cluster.ctl.stats();
+    assert!(stats.snapshot.delivered >= 1, "no snapshot lane delivery: {stats:?}");
+    eventually(WAIT, "lagging follower reports an installed snapshot at index >= 50", || {
+        let snap = cluster.node(lagging).metrics().snapshot.map(|l| l.index);
+        async move { snap.is_some_and(|i| i >= 50) }
+    })
+    .await;
+
+    // No acknowledged write is missing anywhere and the three nodes are identical.
+    cluster.assert_contain_and_identical(&[1, 2, 3], &expected).await;
+}

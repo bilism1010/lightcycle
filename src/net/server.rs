@@ -489,18 +489,19 @@ const ERROR_SEND_TIMEOUT: Duration = Duration::from_secs(2);
 /// `recv-<n>.tmp` from this counter only; no peer-supplied string ever forms part of a path.
 static NEXT_RECV: AtomicU64 = AtomicU64::new(0);
 
-/// Deletes the receive file when dropped unless the install hand-off completed, so every exit
-/// path (protocol error, close, idle timeout, task abort, handler failure) removes it.
+/// Deletes the receive file when dropped, so every exit path (protocol error, close, idle
+/// timeout, task abort, handler failure) removes it. After a successful hand-off the file is
+/// normally already gone (the installer renamed it); if it is still there the installer skipped
+/// the snapshot as stale or duplicate (a leader change can resend one), and removing it here is
+/// what stops that file leaking. The handler only answers `Ok` once an accepted snapshot is
+/// fully installed, so this never removes a file that is still needed.
 struct TmpGuard {
     path: PathBuf,
-    keep: bool,
 }
 
 impl Drop for TmpGuard {
     fn drop(&mut self) {
-        if !self.keep {
-            let _ = std::fs::remove_file(&self.path);
-        }
+        let _ = std::fs::remove_file(&self.path);
     }
 }
 
@@ -671,7 +672,7 @@ async fn run_snapshot_lane(
                     break;
                 };
                 recv = Some(Receive {
-                    guard: TmpGuard { path, keep: false },
+                    guard: TmpGuard { path },
                     file: Arc::new(file),
                     vote: begin.vote,
                     meta: begin.meta,
@@ -742,7 +743,7 @@ async fn run_snapshot_lane(
                     break;
                 }
                 let Receive {
-                    mut guard,
+                    guard,
                     vote,
                     meta,
                     total_len,
@@ -763,8 +764,9 @@ async fn run_snapshot_lane(
                 };
                 match result {
                     Ok(resp) => {
-                        // The handler owns the file now.
-                        guard.keep = true;
+                        // Installed (file renamed away) or skipped as stale: either way the
+                        // receive file is done with, and `guard` removes any remainder.
+                        drop(guard);
                         let Ok(body) = encode_body(&resp) else { break };
                         let reply = Frame::new(SNAP_RESP, Lane::Snapshot, req_id, body);
                         if !send_bounded(&mut framed, reply, idle).await {
