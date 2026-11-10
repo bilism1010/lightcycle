@@ -22,7 +22,7 @@ use lightcycle::net::client::{TcpNetConfig, TcpNetworkFactory};
 use lightcycle::net::handler::RaftHandler;
 use lightcycle::net::server::PeerServer;
 use lightcycle::raft::config::NodeConfig;
-use lightcycle::raft::node::RaftNode;
+use lightcycle::raft::node::{NodeError, RaftNode};
 use lightcycle::raft::types::{KvRequest, KvResponse, SnapshotFile, TypeConfig};
 use lightcycle::wire::frame::Lane;
 use openraft::errors::{Fatal, RaftError};
@@ -177,15 +177,33 @@ fn set(i: usize) -> KvRequest {
     }
 }
 
-/// Write keys `range` through `leader`, 25 at a time concurrently so group commit amortizes the
-/// per-write fsync of the default `Always` mode.
-async fn write_range(leader: &RaftNode, range: std::ops::Range<usize>) {
+/// Commit one write through whichever of `nodes` is the leader, retrying while an election is in
+/// progress. Under load a debug-build node can miss a heartbeat and trigger a legitimate
+/// leadership change mid-test; `Set` is idempotent, so retrying an ambiguous NotLeader is safe.
+async fn write_anywhere(nodes: &[&RaftNode], req: KvRequest) {
+    let deadline = std::time::Instant::now() + WAIT;
+    loop {
+        for n in nodes {
+            match n.write(req.clone()).await {
+                Ok(resp) => {
+                    assert_eq!(resp, KvResponse::Ok);
+                    return;
+                }
+                Err(NodeError::NotLeader { .. }) => {}
+                Err(e) => panic!("write failed on node {}: {e}", n.node_id()),
+            }
+        }
+        assert!(std::time::Instant::now() < deadline, "no node accepted the write as leader");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Write keys `range`, 25 at a time concurrently so group commit amortizes the per-write fsync of
+/// the default `Always` mode.
+async fn write_range(nodes: &[&RaftNode], range: std::ops::Range<usize>) {
     let keys: Vec<usize> = range.collect();
     for batch in keys.chunks(25) {
-        let results = futures::future::join_all(batch.iter().map(|&i| leader.write(set(i)))).await;
-        for r in results {
-            assert_eq!(r.expect("write commits"), KvResponse::Ok);
-        }
+        futures::future::join_all(batch.iter().map(|&i| write_anywhere(nodes, set(i)))).await;
     }
 }
 
@@ -213,10 +231,14 @@ async fn three_nodes_over_tcp_elect_and_replicate() {
     }
 
     let all = [n1.node(), n2.node(), n3.node()];
-    let leader_id = wait_for_leader(&all, WAIT).await;
-    let leader = all.iter().find(|n| n.node_id() == leader_id).unwrap();
+    let first_leader = wait_for_leader(&all, WAIT).await;
 
-    write_range(leader, 0..KEYS).await;
+    write_range(&all, 0..KEYS).await;
+    // Replication has completed, so the leader that acknowledged the writes is known.
+    let leader_id = all
+        .iter()
+        .find_map(|n| n.metrics().current_leader)
+        .unwrap_or(first_leader);
 
     for n in all {
         eventually(WAIT, &format!("node {} holds all {KEYS} keys", n.node_id()), || {
@@ -243,6 +265,133 @@ async fn three_nodes_over_tcp_elect_and_replicate() {
             );
         }
     }
+
+    for n in [n1, n2, n3] {
+        n.shutdown().await;
+    }
+}
+
+/// Settings that make a 300-write run snapshot and purge quickly (as in tests/cluster.rs).
+fn snapshot_tuning(cfg: &mut NodeConfig) {
+    cfg.snapshot_every_entries = 50;
+    cfg.max_in_snapshot_log_to_keep = 10;
+    cfg.purge_batch_size = 10;
+    cfg.wal.segment_size = 4096;
+}
+
+/// File names in `dir` ending in `suffix`, sorted (empty when the directory does not exist).
+fn names_with_suffix(dir: &std::path::Path, suffix: &str) -> Vec<String> {
+    let mut v: Vec<String> = std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.ends_with(suffix))
+                .collect()
+        })
+        .unwrap_or_default();
+    v.sort();
+    v
+}
+
+/// `recv-<digits>.tmp`
+fn is_recv_tmp_name(name: &str) -> bool {
+    name.strip_prefix("recv-")
+        .and_then(|r| r.strip_suffix(".tmp"))
+        .is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tcp_snapshot_lane_install() {
+    const KEYS: usize = 300;
+    let mut n1 = TestNode::bind(1, |c| {
+        c.bootstrap = true;
+        snapshot_tuning(c);
+    })
+    .await;
+    let mut n2 = TestNode::bind(2, snapshot_tuning).await;
+    // Node 3's server is bound (its address is in the membership) but its Raft node is not
+    // started: the other two commit as a majority while it is absent.
+    let mut n3 = TestNode::bind(3, snapshot_tuning).await;
+    n1.start().await;
+    n2.start().await;
+
+    let map = members(&[&n1, &n2, &n3]);
+    assert!(n1.node().bootstrap_if_needed(map).await.unwrap());
+    let pair = [n1.node(), n2.node()];
+    wait_for_leader(&pair, WAIT).await;
+
+    write_range(&pair, 0..KEYS).await;
+
+    // Wait until both running nodes have snapshotted and purged the head of their logs (so
+    // whichever is leader, node 3 can no longer be caught up from the log).
+    eventually(Duration::from_secs(30), "both running nodes snapshotted and purged", || {
+        let ok = pair.iter().all(|n| {
+            let m = n.metrics();
+            m.snapshot.is_some_and(|l| l.index >= 50) && m.purged.is_some_and(|l| l.index >= 1)
+        });
+        async move { ok }
+    })
+    .await;
+
+    // Watch node 3's receive directory from a plain thread: the transfer is only milliseconds
+    // long, so a task on the test runtime could miss the window.
+    let recv_dir = n3.cfg.recv_dir();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let watcher = {
+        let (recv_dir, stop) = (recv_dir.clone(), stop.clone());
+        std::thread::spawn(move || {
+            let mut seen = std::collections::BTreeSet::new();
+            while !stop.load(Ordering::Relaxed) {
+                if let Ok(rd) = std::fs::read_dir(&recv_dir) {
+                    for e in rd.filter_map(|e| e.ok()) {
+                        seen.insert(e.file_name().to_string_lossy().into_owned());
+                    }
+                }
+                std::thread::sleep(Duration::from_micros(200));
+            }
+            seen
+        })
+    };
+
+    // Fresh directory, node starts now and must be brought up to date by a snapshot.
+    n3.start().await;
+    let stale_engine = n3.node().engine();
+
+    eventually(Duration::from_secs(60), "node 3 converges to all 300 keys", || {
+        let ok = holds_all(n3.node(), 0..KEYS);
+        async move { ok }
+    })
+    .await;
+
+    stop.store(true, Ordering::Relaxed);
+    let seen = watcher.join().unwrap();
+    // Best effort: the window is short, so a missed sighting is not a failure, but anything that
+    // was seen must be a well-formed receive file name.
+    for name in &seen {
+        assert!(is_recv_tmp_name(name), "unexpected file in recv dir: {name}");
+    }
+
+    // The engine the node held before the snapshot arrived was replaced, not mutated in place.
+    assert!(
+        !Arc::ptr_eq(&stale_engine, &n3.node().engine()),
+        "install_snapshot swapped the engine; the pre-install Arc is stale"
+    );
+    assert!(stale_engine.get(key(KEYS - 1).as_bytes()).is_none(), "stale engine never saw the data");
+
+    // The snapshot really travelled over the snapshot lane.
+    let s3 = n3.server.stats();
+    assert!(s3.snapshot_chunks.load(Ordering::Relaxed) > 0, "snapshot chunks received on node 3");
+    assert!(s3.accepted(Lane::Snapshot) > 0, "a snapshot lane connection reached node 3");
+    assert_eq!(s3.decode_errors.load(Ordering::Relaxed), 0);
+    assert_eq!(s3.handshake_failures.load(Ordering::Relaxed), 0);
+
+    // Nothing left behind: exactly one installed snapshot, no leftover receive files.
+    eventually(WAIT, "node 3 holds exactly one .snap and no recv leftovers", || {
+        let snaps = names_with_suffix(&n3.cfg.snapshot_dir(), ".snap");
+        let tmps = names_with_suffix(&recv_dir, ".tmp");
+        async move { snaps.len() == 1 && tmps.is_empty() }
+    })
+    .await;
 
     for n in [n1, n2, n3] {
         n.shutdown().await;
