@@ -9,6 +9,8 @@ pub struct Config {
     #[arg(short, long, default_value = "127.0.0.1:7443")]
     pub bind: String,
 
+    /// Static peer list as comma-separated id=addr pairs, e.g. "2=127.0.0.1:7444,3=127.0.0.1:7445"
+    /// (see lightcycle::raft::config::parse_peers).
     #[arg(long, default_value = "")]
     pub peers: String,
 }
