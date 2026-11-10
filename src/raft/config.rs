@@ -86,8 +86,6 @@ pub struct NodeConfig {
     pub node_id: u64,
     /// Cluster name, used only for log context.
     pub cluster_id: String,
-    /// Address this node listens on for Raft traffic.
-    pub bind: String,
     /// Static peer list: node id to address (excludes this node).
     pub peers: BTreeMap<u64, String>,
     /// True on the one node designated to initialize a brand-new cluster.
@@ -126,7 +124,6 @@ impl NodeConfig {
         NodeConfig {
             node_id,
             cluster_id: "lightcycle".to_string(),
-            bind: "127.0.0.1:7443".to_string(),
             peers: BTreeMap::new(),
             bootstrap: false,
             data_dir: data_dir.into(),

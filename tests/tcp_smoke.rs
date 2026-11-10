@@ -144,7 +144,6 @@ impl TestNode {
         )
         .await
         .expect("bind peer server");
-        cfg.bind = server.local_addr().to_string();
         TestNode { cfg, server, deferred, node: None, _dir: dir }
     }
 

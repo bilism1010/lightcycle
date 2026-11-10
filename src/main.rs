@@ -190,7 +190,6 @@ async fn main() -> anyhow::Result<()> {
 
     let mut cfg = NodeConfig::new(config.node_id, config.data_dir());
     cfg.cluster_id = config.cluster_id.to_string();
-    cfg.bind = config.bind.clone();
     cfg.peers = peers.clone();
     cfg.bootstrap = bootstrap;
     cfg.wal.fsync = config.fsync.into();
