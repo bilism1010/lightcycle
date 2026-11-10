@@ -343,11 +343,19 @@ pub fn recover(io: &mut dyn SegmentIo, cfg: &WalConfig) -> Result<RecoveredLog, 
             torn_bytes_discarded: 0,
         });
     }
-    for pair in seqs.windows(2) {
-        if pair[1] != pair[0] + 1 {
-            return Err(corrupt(pair[0] + 1, 0, "segment sequence has a gap"));
-        }
-    }
+    // A purge unlinks its victims oldest first and may sync the directory only afterwards, so a
+    // power loss can persist a later unlink without an earlier one: segments before the last gap
+    // may be fully purged stragglers. They are set aside, not deleted, until the rest of the log
+    // has been read and its start validated against the purge point; any other cause of a gap
+    // (a lost middle segment) fails that validation and is reported as the gap it is.
+    let stragglers: Vec<u64> = match seqs.windows(2).rposition(|p| p[1] != p[0] + 1) {
+        Some(i) => seqs.drain(..=i).collect(),
+        None => Vec::new(),
+    };
+    let gap_error = || {
+        let before = stragglers.last().copied().unwrap_or(0);
+        corrupt(before + 1, 0, "segment sequence has a gap")
+    };
 
     // The last segment decides whether a crash left a half-created file behind, so read it first.
     let mut last_image = None;
@@ -364,6 +372,9 @@ pub fn recover(io: &mut dyn SegmentIo, cfg: &WalConfig) -> Result<RecoveredLog, 
         }
     }
     if seqs.is_empty() {
+        if !stragglers.is_empty() {
+            return Err(gap_error());
+        }
         return Ok(RecoveredLog {
             start: WalStart::fresh(),
             locations: Vec::new(),
@@ -383,7 +394,13 @@ pub fn recover(io: &mut dyn SegmentIo, cfg: &WalConfig) -> Result<RecoveredLog, 
         };
         tail_offset = scanner.scan(seq, &image, is_last)?;
         if is_last {
-            validate_log_start(&scanner, seqs[0])?;
+            validate_log_start(&scanner, seqs[0]).map_err(|e| {
+                if stragglers.is_empty() {
+                    e
+                } else {
+                    gap_error()
+                }
+            })?;
             // Everything past the last valid record must be zero before any append, otherwise a
             // stale valid-looking record could be resurrected later (T-03-18).
             let torn = image[tail_offset..].iter().filter(|b| **b != 0).count() as u64;
@@ -398,6 +415,15 @@ pub fn recover(io: &mut dyn SegmentIo, cfg: &WalConfig) -> Result<RecoveredLog, 
                 torn_bytes_discarded = torn;
             }
         }
+    }
+
+    if !stragglers.is_empty() {
+        // The surviving log starts exactly where the durable purge point says, so these
+        // segments hold only purged entries: finish the interrupted purge.
+        for &seq in &stragglers {
+            io.delete_segment(seq)?;
+        }
+        io.sync_dir()?;
     }
 
     let mut spans: BTreeMap<u64, (u64, u64)> = BTreeMap::new();
@@ -1105,6 +1131,60 @@ mod tests {
             assert_eq!(got.start.state, full.start.state, "after deleting {gone:?}");
             assert_eq!(got.locations, full.locations);
         }
+    }
+
+    /// Three segments: entries 1-3, entries 4-5 plus a purge-through-5 marker, then entry 6 under
+    /// a preamble that carries the purge point `purged_in_preamble`.
+    fn purged_log(purged_in_preamble: u64) -> LogBuilder {
+        let mut b = LogBuilder::new(SEG);
+        b.segment(1, PreambleState::default());
+        for i in 1..=3 {
+            b.entry(i, b"x");
+        }
+        b.segment(4, PreambleState::default());
+        b.entry(4, b"x");
+        b.entry(5, b"x");
+        b.purge(5, b"P5");
+        b.segment(
+            6,
+            PreambleState {
+                purged: Some((purged_in_preamble, b"P".to_vec())),
+                vote: None,
+                committed: None,
+            },
+        );
+        b.entry(6, b"x");
+        b.sync();
+        b
+    }
+
+    #[test]
+    fn purged_straggler_before_a_gap_is_finished_not_fatal() {
+        // The purge unlinked segment 2 and a power loss persisted that, but not the unlink of
+        // segment 1 (which the purge issued first).
+        let b = purged_log(5);
+        let mut io = b.io.clone();
+        io.delete_segment(2).unwrap();
+        io.sync_dir().unwrap();
+        let got = recover(&mut io, &b.cfg()).unwrap();
+        assert_eq!(indices(&got), vec![6]);
+        assert_eq!(got.start.state.purged, Some((5, b"P".to_vec())));
+        assert_eq!(io.list_segments().unwrap(), vec![3], "the straggler was deleted");
+        // And the repaired directory recovers the same way.
+        assert_eq!(indices(&recover(&mut io, &b.cfg()).unwrap()), vec![6]);
+    }
+
+    #[test]
+    fn lost_middle_segment_is_still_a_gap_error_and_nothing_is_deleted() {
+        // The purge point (3) does not explain the missing segment 2 (entries 4-5).
+        let b = purged_log(3);
+        let mut io = b.io.clone();
+        io.delete_segment(2).unwrap();
+        assert!(matches!(
+            recover(&mut io, &b.cfg()),
+            Err(WalError::Corrupt { seq: 2, .. })
+        ));
+        assert_eq!(io.list_segments().unwrap(), vec![1, 3], "nothing was deleted");
     }
 
     #[test]
