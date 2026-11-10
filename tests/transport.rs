@@ -1810,7 +1810,8 @@ async fn snapshot_ack_window_bounds_outstanding_chunks() {
 async fn snapshot_idle_timeout_is_per_chunk_not_total() {
     let td = tempfile::tempdir().unwrap();
     let src = make_file(td.path(), "snap.bin", 8 * 64 * 1024);
-    // Four acknowledgements, each 250 ms late: about a second in total against a 400 ms idle bound.
+    // 8 chunks in windows of 2: the receiver acknowledges the first three windows, each 250 ms
+    // late (about 750 ms in total against a 400 ms idle bound); the final window needs no ack.
     let (addr, _fake) = fake_receiver(2, Duration::from_millis(250)).await;
     let idle = Duration::from_millis(400);
     let mut peer = client_to(addr, snap_cfg(CLIENT_NODE, td.path(), 64 * 1024, 2, idle)).await;

@@ -513,6 +513,8 @@ async fn membership_remove_voter() {
     let before_removal = expected.clone();
     expected.extend(expect_map("b", 0..20));
     cluster.wait_converged(&remaining, &expected).await;
+    // A negative check after a fixed delay: it can only miss a late delivery (a false pass), it
+    // cannot fail spuriously. It is evidence, not proof, that the removed node stays cut off.
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert_eq!(
         dump(&cluster.node(removed).engine()),
@@ -607,6 +609,15 @@ async fn membership_remove_leader_new_leader_elected() {
 // Snapshot catch-up after log purge (plan 03-16).
 // ---------------------------------------------------------------------------------------------
 
+/// A follower that fell behind a purged log catches up through an installed snapshot, while the
+/// other follower restarts from its own snapshot plus log.
+///
+/// Despite the name no node is crash-killed here: `cluster.kill` is a graceful shutdown, and the
+/// partitioned follower is isolated, not killed (crash recovery is covered by
+/// `kill_restart_keeps_committed_writes`). The name is kept because the plans and validation
+/// filters refer to it. The engine-identity assertions below are the proof that the lagging node
+/// installed a snapshot; the lane counter is cluster-wide, since the fake network has no
+/// per-target statistics.
 #[tokio::test(flavor = "multi_thread")]
 async fn kill_restart_snapshot_catchup() {
     let opts = ClusterOpts {
@@ -665,6 +676,7 @@ async fn kill_restart_snapshot_catchup() {
     );
     assert_eq!(dump(&before), base, "the pre-heal engine handle must not have gained the new keys");
 
+    // Cluster-wide, not per node; the lagging node's own snapshot index is checked below.
     let stats = cluster.ctl.stats();
     assert!(stats.snapshot.delivered >= 1, "no snapshot lane delivery: {stats:?}");
     eventually(WAIT, "lagging follower reports an installed snapshot at index >= 50", || {

@@ -279,9 +279,11 @@ async fn three_nodes_over_tcp_elect_and_replicate() {
         assert_eq!(s.decode_errors.load(Ordering::Relaxed), 0, "node {id} decode errors");
         assert_eq!(s.handshake_failures.load(Ordering::Relaxed), 0, "node {id} handshake failures");
         if id != leader_id {
+            // Replication-lane frames only: heartbeat-lane frames are also counted in
+            // `append_req_frames` and would satisfy the check without any log entry travelling.
             assert!(
-                s.append_req_frames.load(Ordering::Relaxed) > 0,
-                "follower {id} received AppendEntries frames over TCP"
+                s.append_frames(Lane::Replication) > 0,
+                "follower {id} received AppendEntries frames on the replication lane over TCP"
             );
         }
     }
@@ -385,8 +387,10 @@ async fn tcp_snapshot_lane_install() {
 
     stop.store(true, Ordering::Relaxed);
     let seen = watcher.join().unwrap();
-    // Best effort: the window is short, so a missed sighting is not a failure, but anything that
-    // was seen must be a well-formed receive file name.
+    // Best effort, and it can pass with no sightings at all: the transfer is milliseconds long.
+    // It only checks that any file that WAS seen has a well-formed receive name. The proof that
+    // the snapshot travelled over the snapshot lane is the chunk and lane counters below, and
+    // the proof of cleanup is the "no recv leftovers" wait at the end.
     for name in &seen {
         assert!(is_recv_tmp_name(name), "unexpected file in recv dir: {name}");
     }

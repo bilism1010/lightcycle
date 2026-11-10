@@ -51,8 +51,10 @@ type ConnSink = SplitSink<Framed<TcpStream, FrameCodec>, Frame>;
 pub struct ServerStats {
     /// Connections accepted past the handshake, indexed by `Lane as usize`.
     pub accepted_by_lane: [AtomicU64; 3],
-    /// AppendEntries request frames received.
+    /// AppendEntries request frames received, on the replication and heartbeat lanes together.
     pub append_req_frames: AtomicU64,
+    /// The same frames split by lane, indexed by `Lane as usize`.
+    pub append_req_frames_by_lane: [AtomicU64; 3],
     /// AppendEntries response frames sent.
     pub append_resp_frames: AtomicU64,
     /// Largest number of AppendEntries requests received but not yet answered on one connection.
@@ -74,6 +76,11 @@ impl ServerStats {
     /// Connections accepted on `lane`.
     pub fn accepted(&self, lane: Lane) -> u64 {
         self.accepted_by_lane[lane as usize].load(Ordering::Relaxed)
+    }
+
+    /// AppendEntries request frames received on `lane`.
+    pub fn append_frames(&self, lane: Lane) -> u64 {
+        self.append_req_frames_by_lane[lane as usize].load(Ordering::Relaxed)
     }
 }
 
@@ -541,6 +548,7 @@ async fn run_lane(
                     },
                 };
                 count(&stats.append_req_frames);
+                count(&stats.append_req_frames_by_lane[lane as usize]);
                 let now = session.inflight.fetch_add(1, Ordering::Relaxed) + 1;
                 stats.max_inflight_observed.fetch_max(now, Ordering::Relaxed);
                 let entry = Inflight {
