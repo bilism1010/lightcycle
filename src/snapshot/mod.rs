@@ -2,3 +2,11 @@
 //!
 //! Invariants: snapshot files are immutable once published; the log is purged only after the
 //! snapshot is durable.
+
+pub mod format;
+pub mod reader;
+pub mod writer;
+
+pub use format::{Meta, SnapshotError};
+pub use reader::{load_snapshot, read_header, validate_file};
+pub use writer::build_snapshot_file;
