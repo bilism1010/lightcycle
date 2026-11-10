@@ -358,3 +358,48 @@ async fn kill_restart_keeps_committed_writes() {
     cluster.assert_contain_and_identical(&[1, 2, 3], &acked).await;
     eprintln!("torn bytes discarded: follower {first:?}, ex-leader {second:?}");
 }
+
+// ---------------------------------------------------------------------------------------------
+// Dynamic membership (plan 03-16).
+// ---------------------------------------------------------------------------------------------
+
+use common::MembershipLog;
+use std::collections::BTreeSet;
+
+fn set_of(ids: &[u64]) -> BTreeSet<u64> {
+    ids.iter().copied().collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn membership_add_voter() {
+    let mut cluster = TestCluster::start(3, ClusterOpts::default()).await;
+    let log = MembershipLog::new();
+    for id in 1..=3 {
+        log.watch(cluster.node(id));
+    }
+    cluster.leader().await;
+    write_keys(&cluster, "a", 0..20).await;
+    let mut expected = expect_map("a", 0..20);
+    cluster.wait_converged(&[1, 2, 3], &expected).await;
+
+    // Learner first: it catches up on the 20 keys before it may vote.
+    cluster.start_extra(4).await;
+    log.watch(cluster.node(4));
+    cluster.add_learner(&[1, 2, 3], 4).await.expect("add learner 4");
+    cluster.wait_converged(&[4], &expected).await;
+    assert!(
+        !cluster.node(4).metrics().membership_config.voter_ids().any(|v| v == 4),
+        "node 4 is a learner, not yet a voter"
+    );
+
+    cluster.change_membership(&[1, 2, 3], &set_of(&[1, 2, 3, 4]), false).await.expect("change");
+    cluster.wait_voters(&[1, 2, 3, 4], &set_of(&[1, 2, 3, 4])).await;
+
+    write_keys(&cluster, "b", 0..20).await;
+    expected.extend(expect_map("b", 0..20));
+    cluster.wait_converged(&[1, 2, 3, 4], &expected).await;
+
+    // Adding one voter to {1,2,3}: old and new quorums intersect, so openraft takes the
+    // single-step path and no joint configuration is ever written.
+    assert!(!log.saw_joint(), "unexpected joint configuration: {:?}", log.configs());
+}

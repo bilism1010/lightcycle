@@ -61,7 +61,8 @@ pub async fn wait_for_leader(nodes: &[&RaftNode], timeout: Duration) -> u64 {
 // In-process multi-node cluster over the fake network (plan 03-14).
 // ---------------------------------------------------------------------------------------------
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -130,6 +131,7 @@ pub struct TestCluster {
     ios: BTreeMap<u64, FakeIo>,
     cfgs: BTreeMap<u64, NodeConfig>,
     members: BTreeMap<u64, BasicNode>,
+    opts: ClusterOpts,
 }
 
 impl TestCluster {
@@ -144,25 +146,98 @@ impl TestCluster {
             ios: BTreeMap::new(),
             cfgs: BTreeMap::new(),
             members,
+            opts: opts.clone(),
         };
         for id in 1..=n as u64 {
-            let dir = tempfile::tempdir().expect("tempdir");
-            let mut cfg = fast_config(id, dir.path());
-            cfg.bootstrap = id == 1;
-            cfg.snapshot_every_entries = opts.snapshot_every;
-            cfg.max_in_snapshot_log_to_keep = opts.max_in_snapshot_log_to_keep;
-            cfg.purge_batch_size = opts.purge_batch_size;
-            cfg.wal.segment_size = opts.segment_size;
-            cluster.dirs.insert(id, dir);
-            cluster.cfgs.insert(id, cfg);
-            if opts.use_fake_io {
-                cluster.ios.insert(id, FakeIo::new());
-            }
+            cluster.prepare_node(id, id == 1);
             cluster.start_node(id).await;
         }
         let members = cluster.members.clone();
         cluster.node(1).bootstrap_if_needed(members).await.expect("bootstrap node 1");
         cluster
+    }
+
+    /// Create the tempdir, config and (optionally) FakeIo for a new node `id`.
+    fn prepare_node(&mut self, id: u64, bootstrap: bool) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut cfg = fast_config(id, dir.path());
+        cfg.bootstrap = bootstrap;
+        cfg.snapshot_every_entries = self.opts.snapshot_every;
+        cfg.max_in_snapshot_log_to_keep = self.opts.max_in_snapshot_log_to_keep;
+        cfg.purge_batch_size = self.opts.purge_batch_size;
+        cfg.wal.segment_size = self.opts.segment_size;
+        self.dirs.insert(id, dir);
+        self.cfgs.insert(id, cfg);
+        if self.opts.use_fake_io {
+            self.ios.insert(id, FakeIo::new());
+        }
+    }
+
+    /// Start a node that is not part of the bootstrap member map (plan 03-16). It is registered on
+    /// the fake network but stays idle until the leader adds it as a learner.
+    pub async fn start_extra(&mut self, id: u64) {
+        assert!(!self.cfgs.contains_key(&id), "node {id} already exists");
+        self.prepare_node(id, false);
+        self.start_node(id).await;
+    }
+
+    /// The fake-network address used for node `id`.
+    pub fn addr(id: u64) -> String {
+        format!("fake-{id}")
+    }
+
+    /// Run a membership operation against the leader among `ids`, retrying while leadership moves.
+    async fn admin<T>(
+        &self,
+        ids: &[u64],
+        op: impl for<'a> Fn(&'a RaftNode) -> Pin<Box<dyn Future<Output = Result<T, NodeError>> + 'a>>,
+    ) -> Result<T, NodeError> {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let leader = self.leader_among(ids).await;
+            match op(self.node(leader)).await {
+                Err(NodeError::NotLeader { .. }) if Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                other => return other,
+            }
+        }
+    }
+
+    /// Add `id` as a learner through the leader among `ids`, blocking until it has caught up.
+    pub async fn add_learner(&self, ids: &[u64], id: u64) -> Result<(), NodeError> {
+        self.admin(ids, |n| Box::pin(n.add_learner(id, Self::addr(id)))).await
+    }
+
+    /// Change the voter set through the leader among `ids`.
+    pub async fn change_membership(
+        &self,
+        ids: &[u64],
+        voters: &BTreeSet<u64>,
+        retain: bool,
+    ) -> Result<(), NodeError> {
+        self.admin(ids, |n| Box::pin(n.change_membership(voters.clone(), retain))).await
+    }
+
+    /// Remove `remove` from the voter set (and the cluster) through the leader among `ids`.
+    pub async fn remove_voters(&self, ids: &[u64], remove: &BTreeSet<u64>) -> Result<(), NodeError> {
+        self.admin(ids, |n| {
+            let remove = remove.clone();
+            Box::pin(async move { n.remove_voters(&remove).await })
+        })
+        .await
+    }
+
+    /// Wait until every node in `ids` reports exactly `voters` as its voter set.
+    pub async fn wait_voters(&self, ids: &[u64], voters: &BTreeSet<u64>) {
+        eventually(Duration::from_secs(15), "nodes report the expected voter set", || {
+            let ok = ids.iter().all(|id| {
+                let m = self.node(*id).metrics();
+                m.membership_config.voter_ids().collect::<BTreeSet<u64>>() == *voters
+            });
+            async move { ok }
+        })
+        .await;
     }
 
     /// Start (or restart) node `id` from its stored config and storage, and register it.
@@ -384,5 +459,56 @@ impl BgWriter {
     pub async fn stop(self) -> BTreeMap<Vec<u8>, Vec<u8>> {
         self.stop.store(true, Ordering::Relaxed);
         self.task.await.expect("background writer task")
+    }
+}
+
+/// Every distinct membership configuration observed in the metrics of the watched nodes, in
+/// order per node. A configuration is the list of voter sets: one set normally, two while a joint
+/// configuration is in effect.
+#[derive(Clone, Default)]
+pub struct MembershipLog {
+    seen: Arc<std::sync::Mutex<Vec<(u64, Vec<BTreeSet<u64>>)>>>,
+}
+
+impl MembershipLog {
+    /// A log with no watched nodes.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Start recording the configurations `node` reports. The task ends when the node stops.
+    pub fn watch(&self, node: &RaftNode) {
+        use openraft::async_runtime::watch::WatchReceiver;
+        let mut rx = node.raft().metrics();
+        let id = node.node_id();
+        let seen = self.seen.clone();
+        tokio::spawn(async move {
+            loop {
+                let cfg = {
+                    let m = rx.borrow_and_update();
+                    m.membership_config.get_joint_config().clone()
+                };
+                {
+                    let mut seen = seen.lock().unwrap();
+                    let last = seen.iter().rev().find(|(n, _)| *n == id).map(|(_, c)| c);
+                    if last != Some(&cfg) {
+                        seen.push((id, cfg));
+                    }
+                }
+                if rx.changed().await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
+    /// Every recorded `(node, configuration)` pair.
+    pub fn configs(&self) -> Vec<(u64, Vec<BTreeSet<u64>>)> {
+        self.seen.lock().unwrap().clone()
+    }
+
+    /// Whether any watched node reported a joint configuration (two voter sets).
+    pub fn saw_joint(&self) -> bool {
+        self.configs().iter().any(|(_, c)| c.len() > 1)
     }
 }
