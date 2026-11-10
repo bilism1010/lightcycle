@@ -90,6 +90,8 @@ impl RaftNode {
         N: RaftNetworkFactory<TypeConfig>,
         N::Network: NetSnapshot<TypeConfig, SnapshotData = SnapshotFile>,
     {
+        // Before anything touches the disk: a rejected config must leave no directories behind.
+        cfg.validate()?;
         let wal_dir = cfg.wal_dir();
         let io = tokio::task::spawn_blocking(move || StdFsIo::new(wal_dir))
             .await

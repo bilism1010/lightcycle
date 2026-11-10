@@ -73,6 +73,21 @@ async fn single_node_restart() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn rejected_config_leaves_nothing_on_disk() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let mut cfg = fast_config(1, &data);
+    cfg.snapshot_every_entries = 0;
+    let ctl = NetController::new();
+    match RaftNode::start(cfg, ctl.factory(1)).await {
+        Err(lightcycle::raft::node::NodeError::Config(_)) => {}
+        Err(other) => panic!("expected a config error, got {other:?}"),
+        Ok(_) => panic!("an invalid config must not start a node"),
+    }
+    assert!(!data.exists(), "validation runs before any directory is created");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn oversized_write_is_rejected_without_stopping_the_node() {
     let dir = tempfile::tempdir().unwrap();
     let node = start(bootstrap_cfg(dir.path())).await;
