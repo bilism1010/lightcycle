@@ -49,8 +49,9 @@ pub struct Config {
     pub bind: String,
 
     /// Address other nodes use to reach this one, published in the cluster membership when this
-    /// node bootstraps a cluster. Defaults to the bound address, which must then not be a
-    /// wildcard (`0.0.0.0`, `[::]`): a wildcard is not routable from other hosts.
+    /// node bootstraps a multi-node cluster. Defaults to the bound address, which must then not
+    /// be a wildcard (`0.0.0.0`, `[::]`): a wildcard is not routable from other hosts. Restarts
+    /// and standalone nodes publish nothing and do not need it.
     #[arg(long)]
     pub advertise: Option<String>,
 
@@ -119,6 +120,24 @@ fn advertised_addr(advertise: Option<&str>, local: SocketAddr) -> anyhow::Result
     let port: u16 = port.parse().context("--advertise port")?;
     let port = if port == 0 { local.port() } else { port };
     Ok(format!("{host}:{port}"))
+}
+
+/// The address this node puts into the membership it may initialize.
+///
+/// Only a start that initializes a multi-node cluster publishes an address other nodes must be
+/// able to dial, so only that start validates it. A one-member cluster (`standalone`) has no peer
+/// to dial this node, and a start that does not initialize publishes nothing; both use the bound
+/// address as is. An explicit `--advertise` is still validated and honored when initializing.
+fn published_addr(
+    will_initialize: bool,
+    standalone: bool,
+    advertise: Option<&str>,
+    local: SocketAddr,
+) -> anyhow::Result<String> {
+    if !will_initialize || (standalone && advertise.is_none()) {
+        return Ok(local.to_string());
+    }
+    advertised_addr(advertise, local)
 }
 
 /// Resolve when SIGINT (ctrl-c) or, on unix, SIGTERM arrives.
@@ -200,18 +219,33 @@ async fn main() -> anyhow::Result<()> {
         .into_iter()
         .map(|(id, addr)| (id, BasicNode { addr }))
         .collect();
-    let advertise = if bootstrap {
-        match advertised_addr(config.advertise.as_deref(), local_addr) {
-            Ok(addr) => addr,
+    // The membership is written only when this start actually initializes a cluster, so the
+    // address check runs only then: a restart of a bootstrap node, or a start that finds the
+    // cluster already initialized, publishes nothing.
+    let will_initialize = if bootstrap {
+        match node.raft().is_initialized().await {
+            Ok(initialized) => !initialized,
             Err(e) => {
                 server.shutdown().await;
                 let _ = node.shutdown().await;
-                return Err(e);
+                return Err(anyhow::anyhow!("{e}")).context("could not read the cluster state");
             }
         }
     } else {
-        // Only the node that initializes the cluster publishes its own address.
-        local_addr.to_string()
+        false
+    };
+    let advertise = match published_addr(
+        will_initialize,
+        members.is_empty(),
+        config.advertise.as_deref(),
+        local_addr,
+    ) {
+        Ok(addr) => addr,
+        Err(e) => {
+            server.shutdown().await;
+            let _ = node.shutdown().await;
+            return Err(e);
+        }
     };
     members.insert(config.node_id, BasicNode { addr: advertise });
     match node.bootstrap_if_needed(members).await {
@@ -283,6 +317,22 @@ mod tests {
     fn wildcard_bind_without_advertise_is_refused() {
         assert!(advertised_addr(None, local("0.0.0.0:7443")).is_err());
         assert!(advertised_addr(None, local("[::]:7443")).is_err());
+    }
+
+    #[test]
+    fn wildcard_check_runs_only_when_a_multi_node_cluster_is_initialized() {
+        let wildcard = local("0.0.0.0:7443");
+        // Initializing a cluster with peers publishes the address, so a wildcard is refused.
+        assert!(published_addr(true, false, None, wildcard).is_err());
+        assert_eq!(
+            published_addr(true, false, Some("10.0.0.5:7443"), wildcard).unwrap(),
+            "10.0.0.5:7443"
+        );
+        // A restart (nothing published) and a standalone node (no peer to dial it) are fine.
+        assert_eq!(published_addr(false, false, None, wildcard).unwrap(), "0.0.0.0:7443");
+        assert_eq!(published_addr(true, true, None, wildcard).unwrap(), "0.0.0.0:7443");
+        // An explicit advertise on a standalone initialization is still validated.
+        assert!(published_addr(true, true, Some("0.0.0.0:7443"), wildcard).is_err());
     }
 
     #[test]

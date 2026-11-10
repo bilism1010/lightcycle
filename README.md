@@ -122,7 +122,8 @@ cargo run -- --node-id 3 --bind 127.0.0.1:7443 --peers "1=127.0.0.1:7441,2=127.0
 ```
 
 Other flags: `--advertise <host:port>` (the address published in the membership by the bootstrap
-node; defaults to `--bind`, and is required when binding a wildcard such as `0.0.0.0`),
+node; defaults to `--bind`, and is required only when a new multi-node cluster is bootstrapped
+from a wildcard bind such as `0.0.0.0`; restarts and standalone nodes do not need it),
 `--data-dir <path>`, `--cluster-id <n>` (default 1; nodes with different values
 refuse each other), `--fsync always|periodic|never` (default `always`) and
 `--snapshot-every <entries>` (default 1000000). The binary prints `[Lightcycle] node <id> is leader
