@@ -191,9 +191,18 @@ fn expect_map(prefix: &str, range: std::ops::Range<usize>) -> BTreeMap<Vec<u8>, 
 }
 
 async fn write_keys(cluster: &TestCluster, prefix: &str, range: std::ops::Range<usize>) {
+    write_keys_among(cluster, &cluster.live_ids(), prefix, range).await;
+}
+
+async fn write_keys_among(
+    cluster: &TestCluster,
+    ids: &[u64],
+    prefix: &str,
+    range: std::ops::Range<usize>,
+) {
     for i in range {
         let resp = cluster
-            .write_via_leader(set_req(&format!("{prefix}-{i:03}"), &format!("val-{i:03}")))
+            .write_among(ids, set_req(&format!("{prefix}-{i:03}"), &format!("val-{i:03}")))
             .await
             .expect("write acknowledged");
         assert_eq!(resp, KvResponse::Ok);
@@ -222,4 +231,70 @@ async fn three_node_election_and_replication() {
         async move { ok }
     })
     .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn leader_failover_new_leader_elected() {
+    let mut cluster = TestCluster::start(3, ClusterOpts::default()).await;
+    let old_leader = cluster.leader().await;
+
+    write_keys(&cluster, "a", 0..20).await;
+    let mut expected = expect_map("a", 0..20);
+    cluster.wait_converged(&[1, 2, 3], &expected).await;
+
+    cluster.kill(old_leader).await;
+    let survivors: Vec<u64> = (1..=3).filter(|id| *id != old_leader).collect();
+    let new_leader = cluster.leader_among(&survivors).await;
+    assert_ne!(new_leader, old_leader, "a different node must lead after the kill");
+
+    // Two of three nodes still accept and commit writes.
+    write_keys(&cluster, "b", 0..20).await;
+    expected.extend(expect_map("b", 0..20));
+    cluster.wait_converged(&survivors, &expected).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn partition_heals_and_minority_converges() {
+    let cluster = TestCluster::start(3, ClusterOpts::default()).await;
+    let old_leader = cluster.leader().await;
+    let old_term = cluster.node(old_leader).metrics().current_term;
+
+    write_keys(&cluster, "a", 0..10).await;
+    let mut expected = expect_map("a", 0..10);
+    cluster.wait_converged(&[1, 2, 3], &expected).await;
+
+    cluster.ctl.isolate(old_leader);
+    let majority: Vec<u64> = (1..=3).filter(|id| *id != old_leader).collect();
+    let new_leader = cluster.leader_among(&majority).await;
+    assert_ne!(new_leader, old_leader);
+    assert!(
+        cluster.node(new_leader).metrics().current_term > old_term,
+        "the majority side must elect in a higher term"
+    );
+
+    // The majority keeps committing.
+    write_keys_among(&cluster, &majority, "b", 0..10).await;
+    expected.extend(expect_map("b", 0..10));
+    cluster.wait_converged(&majority, &expected).await;
+
+    // The isolated old leader cannot commit: its write never returns Ok.
+    let res = tokio::time::timeout(
+        Duration::from_secs(2),
+        cluster.node(old_leader).write(set_req("minority-only", "must-not-commit")),
+    )
+    .await;
+    assert!(!matches!(res, Ok(Ok(_))), "isolated leader committed a write: {res:?}");
+
+    // Heal: the old leader steps down, discards its uncommitted entry and converges.
+    cluster.ctl.heal();
+    eventually(Duration::from_secs(15), "old leader steps down behind the new leader", || {
+        let m = cluster.node(old_leader).metrics();
+        async move { m.current_leader.is_some_and(|l| l != old_leader) }
+    })
+    .await;
+    cluster.wait_converged(&[1, 2, 3], &expected).await;
+    assert!(
+        cluster.node(old_leader).engine().get(b"minority-only").is_none(),
+        "the uncommitted write must be absent"
+    );
 }

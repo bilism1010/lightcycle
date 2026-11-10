@@ -206,9 +206,19 @@ impl TestCluster {
 
     /// Write through the current leader, retrying while leadership moves.
     pub async fn write_via_leader(&self, req: KvRequest) -> Result<KvResponse, NodeError> {
+        self.write_among(&self.live_ids(), req).await
+    }
+
+    /// Like [`write_via_leader`](Self::write_via_leader) but only the nodes in `ids` need to
+    /// agree on the leader; used while a partitioned node holds a stale view of leadership.
+    pub async fn write_among(
+        &self,
+        ids: &[u64],
+        req: KvRequest,
+    ) -> Result<KvResponse, NodeError> {
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
-            let leader = self.leader().await;
+            let leader = self.leader_among(ids).await;
             match self.node(leader).write(req.clone()).await {
                 Err(NodeError::NotLeader { .. }) if Instant::now() < deadline => {
                     tokio::time::sleep(Duration::from_millis(20)).await;
