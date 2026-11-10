@@ -26,7 +26,8 @@ extract_p99() {
   printf '%s\n' "$1" \
     | grep -F "[tail] $2" \
     | head -n1 \
-    | sed -n 's/.*p99= *\([0-9][0-9]*\)ns.*/\1/p'
+    | sed -n 's/.*p99= *\([0-9][0-9]*\)ns.*/\1/p' \
+    || true  # no matching line is an empty result for the caller's diagnostic, not a set -e exit
 }
 
 for attempt in $(seq 1 "$ATTEMPTS"); do
