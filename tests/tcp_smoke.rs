@@ -106,6 +106,18 @@ impl RaftHandler for DeferredHandler {
             None => Box::pin(async { Err(Fatal::Stopped) }),
         }
     }
+
+    fn validate_snapshot(
+        &self,
+        meta: &SnapshotMetaOf<TypeConfig>,
+        file: &SnapshotFile,
+    ) -> BoxFuture<'static, Result<(), String>> {
+        match self.inner.get() {
+            Some(h) => h.validate_snapshot(meta, file),
+            // Not started: let `install_snapshot` answer with its retryable "stopped" failure.
+            None => Box::pin(async { Ok(()) }),
+        }
+    }
 }
 
 /// One node of the test cluster: its directory, bound server and (once started) Raft node.
@@ -402,4 +414,57 @@ async fn tcp_snapshot_lane_install() {
     for n in [n1, n2, n3] {
         n.shutdown().await;
     }
+}
+
+/// A peer that streams a garbage snapshot is refused at the transport with a non-fatal failure.
+/// Handed to openraft it would be a state machine error, which stops the receiving node, and the
+/// peer port is unauthenticated.
+#[tokio::test(flavor = "multi_thread")]
+async fn corrupt_snapshot_from_a_peer_does_not_stop_the_node() {
+    use openraft::errors::StreamingError;
+    use openraft::network::RPCOption;
+    use openraft::{RaftNetworkFactory, RaftNetworkV2};
+
+    let mut n1 = TestNode::bind(1, |c| c.bootstrap = true).await;
+    n1.start().await;
+    assert!(n1.node().bootstrap_if_needed(members(&[&n1])).await.unwrap());
+    wait_for_leader(&[n1.node()], WAIT).await;
+    write_anywhere(&[n1.node()], set(0)).await;
+
+    let scratch = tempfile::tempdir().unwrap();
+    let path = scratch.path().join("garbage.snap");
+    std::fs::write(&path, vec![0xA5u8; 4096]).unwrap();
+    let snapshot = openraft::Snapshot {
+        meta: openraft::SnapshotMeta {
+            last_log_id: Some(openraft::LogId::new_term_index(1, 5)),
+            last_membership: Default::default(),
+        },
+        snapshot: SnapshotFile { path, len: 4096 },
+    };
+    // A vote above the node's own: without the transport check this reaches the state machine.
+    let vote = VoteOf::<TypeConfig>::new_committed(1000, 2);
+
+    let mut factory = TcpNetworkFactory::new(TcpNetConfig::new(
+        CLUSTER_ID,
+        2,
+        scratch.path().join("recv"),
+    ));
+    let mut peer = factory.new_snapshot_client(1, &BasicNode { addr: n1.addr() }).await;
+    let outcome = peer
+        .full_snapshot(
+            vote,
+            snapshot,
+            futures::future::pending::<openraft::errors::ReplicationClosed>(),
+            RPCOption::new(Duration::from_secs(4)),
+        )
+        .await;
+    assert!(
+        matches!(outcome, Err(StreamingError::Network(_))),
+        "the corrupt snapshot is refused: {outcome:?}"
+    );
+
+    // The node is still running and still takes writes.
+    write_anywhere(&[n1.node()], set(1)).await;
+    assert!(holds_all(n1.node(), 0..2));
+    n1.shutdown().await;
 }

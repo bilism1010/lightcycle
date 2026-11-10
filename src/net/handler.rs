@@ -20,6 +20,7 @@ use openraft::type_config::alias::{SnapshotMetaOf, VoteOf};
 use openraft::{Raft, Snapshot};
 
 use crate::raft::types::{SnapshotFile, TypeConfig};
+use crate::snapshot::validate_file;
 
 /// Handles inbound Raft RPCs on the receiving node.
 pub trait RaftHandler: Send + Sync + 'static {
@@ -54,6 +55,19 @@ pub trait RaftHandler: Send + Sync + 'static {
         meta: SnapshotMetaOf<TypeConfig>,
         file: SnapshotFile,
     ) -> BoxFuture<'static, Result<SnapshotResponse<TypeConfig>, Fatal<TypeConfig>>>;
+
+    /// Check a completely received snapshot file before it is handed to
+    /// [`install_snapshot`](Self::install_snapshot). An `Err` is a refusal that the transport
+    /// answers with a non-fatal failure and drops the file: a bad file from a faulty or hostile
+    /// peer must never reach openraft, which treats a state machine error as fatal for the
+    /// node. The default accepts everything (stubs that do not read the file).
+    fn validate_snapshot(
+        &self,
+        _meta: &SnapshotMetaOf<TypeConfig>,
+        _file: &SnapshotFile,
+    ) -> BoxFuture<'static, Result<(), String>> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 impl<SM> RaftHandler for Raft<TypeConfig, SM>
@@ -104,6 +118,24 @@ where
                 snapshot: file,
             };
             Raft::install_full_snapshot(&raft, vote, snapshot).await
+        })
+    }
+
+    fn validate_snapshot(
+        &self,
+        meta: &SnapshotMetaOf<TypeConfig>,
+        file: &SnapshotFile,
+    ) -> BoxFuture<'static, Result<(), String>> {
+        let expected = meta.clone();
+        let path = file.path.clone();
+        Box::pin(async move {
+            let checked = tokio::task::spawn_blocking(move || match validate_file(&path) {
+                Ok(header) if header == expected => Ok(()),
+                Ok(_) => Err("snapshot header does not match the announced metadata".to_string()),
+                Err(e) => Err(format!("invalid snapshot file: {e}")),
+            })
+            .await;
+            checked.unwrap_or_else(|e| Err(format!("snapshot validation did not finish: {e}")))
         })
     }
 }

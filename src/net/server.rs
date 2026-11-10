@@ -839,6 +839,21 @@ async fn run_snapshot_lane(
                     total_len,
                     ..
                 } = r;
+                // Refuse a corrupt or mismatched file here, with a non-fatal failure: handed to
+                // openraft it would be a state machine error, which stops the whole node.
+                let validated = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => break,
+                    result = handler.validate_snapshot(
+                        &meta,
+                        &SnapshotFile { path: guard.path.clone(), len: total_len },
+                    ) => result,
+                };
+                if let Err(why) = validated {
+                    // `guard` drops at the break and removes the file.
+                    snapshot_reject(&mut framed, &stats, req_id, false, &why).await;
+                    break;
+                }
                 let installed = handler.install_snapshot(
                     vote,
                     meta,
