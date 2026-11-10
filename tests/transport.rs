@@ -649,8 +649,14 @@ async fn inflight_window_bounded() {
         .await
         .expect("stream established");
 
-    // Responses are withheld: exactly one window of frames reaches the server.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Responses are withheld: exactly one window of frames reaches the server. Wait for the
+    // window to fill (no fixed sleep decides that), then hold it open briefly to show the count
+    // does not exceed the window.
+    eventually("the request window to fill", || {
+        stats.append_req_frames.load(Ordering::Relaxed) >= 4
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(stats.append_req_frames.load(Ordering::Relaxed), 4);
     assert_eq!(stats.max_inflight_observed.load(Ordering::Relaxed), 4);
 
@@ -686,7 +692,11 @@ async fn byte_window_admits_oversized_request_alone() {
         .await
         .expect("stream established");
 
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    eventually("the byte window to fill", || {
+        stats.append_req_frames.load(Ordering::Relaxed) >= 2
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(
         stats.append_req_frames.load(Ordering::Relaxed),
         2,
