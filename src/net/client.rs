@@ -84,6 +84,14 @@ pub struct TcpNetConfig {
     pub snapshot_install_timeout: Duration,
     /// Largest snapshot a receiver accepts, in bytes.
     pub max_snapshot_bytes: u64,
+    /// Most connections the server holds open at once, handshaken or not (default 512). Each
+    /// peer uses at most three, so this is generous for a cluster; a connection over the cap is
+    /// closed immediately, which bounds the memory a flood of sockets can pin.
+    pub max_connections: usize,
+    /// Most snapshot receives running at once on the server (default 2: one from the leader plus
+    /// one overlapping a leader change). A further `SNAP_BEGIN` is refused, which bounds the
+    /// disk a flood of senders can claim.
+    pub max_snapshot_receives: usize,
     /// TCP keepalive idle time on dialed and accepted sockets (default 30 s; zero disables). A
     /// peer host that vanished without a FIN or RST is then detected instead of leaking its
     /// connection state forever.
@@ -114,6 +122,8 @@ impl TcpNetConfig {
             snapshot_idle_timeout: Duration::from_secs(30),
             snapshot_install_timeout: Duration::from_secs(600),
             max_snapshot_bytes: 8 * 1024 * 1024 * 1024,
+            max_connections: 512,
+            max_snapshot_receives: 2,
             keepalive_time: Duration::from_secs(30),
             write_timeout: Duration::from_secs(30),
             heartbeat_idle_timeout: Duration::from_secs(60),

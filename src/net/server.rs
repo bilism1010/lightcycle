@@ -63,6 +63,10 @@ pub struct ServerStats {
     pub handshake_failures: AtomicU64,
     /// Snapshot chunks accepted (offset and size validated, bytes written).
     pub snapshot_chunks: AtomicU64,
+    /// Connections closed on accept because `max_connections` were already open.
+    pub connections_rejected: AtomicU64,
+    /// Snapshot begins refused because `max_snapshot_receives` were already running.
+    pub snapshot_receives_rejected: AtomicU64,
 }
 
 impl ServerStats {
@@ -91,11 +95,16 @@ impl PeerServer {
         let local_addr = listener.local_addr()?;
         let stats = Arc::new(ServerStats::default());
         let cancel = CancellationToken::new();
+        let limits = Limits {
+            connections: Arc::new(Semaphore::new(cfg.max_connections.max(1))),
+            snapshot_receives: Arc::new(Semaphore::new(cfg.max_snapshot_receives.max(1))),
+        };
         let task = tokio::spawn(accept_loop(
             listener,
             Arc::new(cfg),
             handler,
             stats.clone(),
+            limits,
             cancel.clone(),
         ));
         Ok(PeerServer {
@@ -129,11 +138,19 @@ impl Drop for PeerServer {
     }
 }
 
+/// Server-wide resource caps shared by every connection.
+#[derive(Clone)]
+struct Limits {
+    connections: Arc<Semaphore>,
+    snapshot_receives: Arc<Semaphore>,
+}
+
 async fn accept_loop(
     listener: TcpListener,
     cfg: Arc<TcpNetConfig>,
     handler: Arc<dyn RaftHandler>,
     stats: Arc<ServerStats>,
+    limits: Limits,
     cancel: CancellationToken,
 ) {
     // Dropping the set on exit aborts every connection task.
@@ -144,11 +161,20 @@ async fn accept_loop(
             _ = cancel.cancelled() => break,
             accepted = listener.accept() => match accepted {
                 Ok((socket, _peer)) => {
+                    let Ok(slot) = limits.connections.clone().try_acquire_owned() else {
+                        // Over the cap: refuse by closing, before any buffer is allocated.
+                        count(&stats.connections_rejected);
+                        tracing::warn!("peer connection limit reached; dropping new connection");
+                        drop(socket);
+                        continue;
+                    };
                     conns.spawn(serve_connection(
                         socket,
                         cfg.clone(),
                         handler.clone(),
                         stats.clone(),
+                        limits.snapshot_receives.clone(),
+                        slot,
                         cancel.child_token(),
                     ));
                 }
@@ -178,6 +204,8 @@ async fn serve_connection(
     cfg: Arc<TcpNetConfig>,
     handler: Arc<dyn RaftHandler>,
     stats: Arc<ServerStats>,
+    snapshot_slots: Arc<Semaphore>,
+    _connection_slot: OwnedSemaphorePermit,
     cancel: CancellationToken,
 ) {
     let _ = socket.set_nodelay(true);
@@ -204,7 +232,7 @@ async fn serve_connection(
         .codec_mut()
         .set_max_frame_length(cfg.lane_frame_cap(lane));
     if lane == Lane::Snapshot {
-        run_snapshot_lane(framed, cfg, handler, stats, cancel).await;
+        run_snapshot_lane(framed, cfg, handler, stats, snapshot_slots, cancel).await;
     } else {
         run_lane(framed, lane, cfg, handler, stats, cancel).await;
     }
@@ -552,6 +580,8 @@ impl Drop for TmpGuard {
 
 /// An active snapshot receive: at most one per connection.
 struct Receive {
+    /// Held until the receive (including its install) ends.
+    _slot: OwnedSemaphorePermit,
     guard: TmpGuard,
     file: Arc<File>,
     vote: openraft::type_config::alias::VoteOf<TypeConfig>,
@@ -649,6 +679,7 @@ async fn run_snapshot_lane(
     cfg: Arc<TcpNetConfig>,
     handler: Arc<dyn RaftHandler>,
     stats: Arc<ServerStats>,
+    snapshot_slots: Arc<Semaphore>,
     cancel: CancellationToken,
 ) {
     let window = cfg.snapshot_ack_window.max(1);
@@ -702,6 +733,19 @@ async fn run_snapshot_lane(
                         .await;
                     break;
                 }
+                // A receive claims up to `max_snapshot_bytes` of disk: bound how many run at once.
+                let Ok(slot) = snapshot_slots.clone().try_acquire_owned() else {
+                    count(&stats.snapshot_receives_rejected);
+                    snapshot_reject(
+                        &mut framed,
+                        &stats,
+                        req_id,
+                        false,
+                        "too many concurrent snapshot receives",
+                    )
+                    .await;
+                    break;
+                };
                 let dir = cfg.recv_dir.clone();
                 let created =
                     tokio::task::spawn_blocking(move || create_recv_file(&dir)).await;
@@ -717,6 +761,7 @@ async fn run_snapshot_lane(
                     break;
                 };
                 recv = Some(Receive {
+                    _slot: slot,
                     guard: TmpGuard { path },
                     file: Arc::new(file),
                     vote: begin.vote,

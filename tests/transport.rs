@@ -354,6 +354,96 @@ async fn wrong_node_at_the_dialed_address_is_rejected_over_tcp() {
 }
 
 #[tokio::test]
+async fn connections_over_the_cap_are_dropped_and_slots_are_reused() {
+    let stub = Arc::new(StubHandler::default());
+    let server = start_server(stub, |cfg| cfg.max_connections = 2).await;
+    let stats = server.stats();
+
+    let first = raw_conn(&server, Lane::Replication).await;
+    let second = raw_conn(&server, Lane::Heartbeat).await;
+    eventually("both connections to be accepted", || {
+        stats.accepted(Lane::Replication) + stats.accepted(Lane::Heartbeat) == 2
+    })
+    .await;
+
+    // The third socket is accepted by the kernel but closed at once, before any handshake.
+    let mut third = TcpStream::connect(server.local_addr()).await.unwrap();
+    let mut buf = [0u8; 8];
+    let n = tokio::time::timeout(Duration::from_secs(2), third.read(&mut buf))
+        .await
+        .expect("over-cap connection must be closed promptly")
+        .unwrap_or(0);
+    assert_eq!(n, 0);
+    assert_eq!(stats.connections_rejected.load(Ordering::Relaxed), 1);
+
+    // Closing one frees its slot.
+    drop(first);
+    let mut replacement = None;
+    for _ in 0..50 {
+        let socket = TcpStream::connect(server.local_addr()).await.unwrap();
+        let mut framed = Framed::new(socket, FrameCodec::new(1 << 20));
+        let hello = Hello::new(CLUSTER, CLIENT_NODE, Lane::Replication);
+        if client_handshake(&mut framed, hello, Duration::from_millis(500)).await.is_ok() {
+            replacement = Some(framed);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(replacement.is_some(), "a freed slot must be reusable");
+    drop(second);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn concurrent_snapshot_receives_are_capped() {
+    let td = tempfile::tempdir().unwrap();
+    let recv_dir = td.path().join("recv");
+    let stub = Arc::new(StubHandler::default());
+    let server = start_server(stub, |cfg| {
+        cfg.recv_dir = recv_dir.clone();
+        cfg.max_snapshot_receives = 1;
+    })
+    .await;
+    let stats = server.stats();
+
+    // The first receive begins and stays open.
+    let mut first = raw_conn(&server, Lane::Snapshot).await;
+    first.send(begin_frame(1024)).await.unwrap();
+    {
+        let dir = recv_dir.clone();
+        eventually("the first receive file to exist", move || dir_entries(&dir).len() == 1).await;
+    }
+
+    // A second sender is refused with a reason and disconnected; no second file is claimed.
+    let mut second = raw_conn(&server, Lane::Snapshot).await;
+    second.send(begin_frame(1024)).await.unwrap();
+    let reply = tokio::time::timeout(Duration::from_secs(2), second.next())
+        .await
+        .expect("a refusal is sent")
+        .expect("frame")
+        .expect("decodes");
+    assert_eq!(reply.header.kind, KIND_ERROR);
+    expect_closed(&mut second).await;
+    assert_eq!(stats.snapshot_receives_rejected.load(Ordering::Relaxed), 1);
+    assert_eq!(dir_entries(&recv_dir).len(), 1);
+
+    // Ending the first receive frees the slot.
+    drop(first);
+    let mut third = None;
+    for _ in 0..50 {
+        let mut conn = raw_conn(&server, Lane::Snapshot).await;
+        conn.send(begin_frame(1024)).await.unwrap();
+        let waited = tokio::time::timeout(Duration::from_millis(150), conn.next()).await;
+        if waited.is_err() {
+            third = Some(conn); // no refusal: the receive began
+            break;
+        }
+    }
+    assert!(third.is_some(), "a freed snapshot slot must be reusable");
+    server.shutdown().await;
+}
+
+#[tokio::test]
 async fn silent_heartbeat_connection_is_closed_after_the_idle_bound() {
     let stub = Arc::new(StubHandler::default());
     let server = start_server(stub, |cfg| {
