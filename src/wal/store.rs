@@ -443,7 +443,7 @@ impl RaftLogReader<TypeConfig> for WalLogReader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wal::io::FakeIo;
+    use crate::wal::io::{FakeIo, IoEvent, SegmentIo};
     use bytes::Bytes;
     use openraft::type_config::TypeConfigExt;
 
@@ -512,6 +512,314 @@ mod tests {
         let stats = store.recovery_stats();
         assert_eq!(stats.entries_recovered, 2);
         assert_eq!(stats.torn_bytes_discarded, 0);
+        store.shutdown().await;
+    }
+
+    fn entries(lo: u64, hi: u64, term: u64, len: usize) -> Vec<Entry> {
+        (lo..=hi).map(|i| entry(term, i, len)).collect()
+    }
+
+    async fn read_all(store: &mut WalLogStore, lo: u64, hi: u64) -> Vec<Entry> {
+        store.get_log_reader().await.try_get_log_entries(lo..=hi).await.unwrap()
+    }
+
+    fn seg_list(io: &FakeIo) -> Vec<u64> {
+        SegmentIo::list_segments(io).unwrap()
+    }
+
+    #[tokio::test]
+    async fn truncate_marker() {
+        let io = FakeIo::new();
+        let mut store = open(&io, 1 << 16);
+        append_sync(&mut store, entries(1, 5, 1, 16)).await;
+        let before = io.durable_bytes(1);
+
+        store.truncate_after(Some(log_id(1, 3))).await.unwrap();
+        assert_eq!(store.get_log_state().await.unwrap().last_log_id, Some(log_id(1, 3)));
+        assert_eq!(read_all(&mut store, 1, 6).await, entries(1, 3, 1, 16));
+        append_sync(&mut store, entries(4, 6, 2, 16)).await;
+
+        let mut want = entries(1, 3, 1, 16);
+        want.extend(entries(4, 6, 2, 16));
+        assert_eq!(read_all(&mut store, 1, 6).await, want);
+        let after = io.durable_bytes(1);
+        // Segments are preallocated zero-filled: only the written prefix must be unchanged.
+        let used = before.iter().rposition(|b| *b != 0).unwrap() + 1;
+        assert_eq!(&after[..used], &before[..used], "truncation is a marker, not an edit");
+        store.shutdown().await;
+
+        let mut store = open(&io, 1 << 16);
+        assert_eq!(store.get_log_state().await.unwrap().last_log_id, Some(log_id(2, 6)));
+        assert_eq!(read_all(&mut store, 1, 6).await, want);
+        store.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn truncate_everything_then_reappend() {
+        let io = FakeIo::new();
+        let mut store = open(&io, 1 << 16);
+        append_sync(&mut store, entries(0, 3, 1, 8)).await;
+        store.truncate_after(None).await.unwrap();
+        assert_eq!(store.get_log_state().await.unwrap().last_log_id, None);
+        assert!(read_all(&mut store, 0, 10).await.is_empty());
+        append_sync(&mut store, entries(0, 1, 2, 8)).await;
+        store.shutdown().await;
+        let mut store = open(&io, 1 << 16);
+        assert_eq!(read_all(&mut store, 0, 10).await, entries(0, 1, 2, 8));
+        store.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn preamble_survives_purge() {
+        let io = FakeIo::new();
+        let mut store = open(&io, 4096);
+        let v = vote(3, 9);
+        // The vote record lives in segment 1, which the purge deletes.
+        store.save_vote(&v).await.unwrap();
+        for chunk in 0..6 {
+            let lo = chunk * 10 + 1;
+            append_sync(&mut store, entries(lo, lo + 9, 1, 200)).await;
+        }
+        assert!(seg_list(&io).len() >= 4, "several segments rolled: {:?}", seg_list(&io));
+        store.purge(log_id(1, 50)).await.unwrap();
+        assert!(seg_list(&io)[0] > 1, "old segments were deleted: {:?}", seg_list(&io));
+        assert_eq!(store.get_log_state().await.unwrap().last_purged_log_id, Some(log_id(1, 50)));
+        store.shutdown().await;
+
+        let mut store = open(&io, 4096);
+        let state = store.get_log_state().await.unwrap();
+        assert_eq!(state.last_purged_log_id, Some(log_id(1, 50)));
+        assert_eq!(state.last_log_id, Some(log_id(1, 60)));
+        let mut reader = store.get_log_reader().await;
+        assert_eq!(reader.read_vote().await.unwrap(), Some(v));
+        assert_eq!(read_all(&mut store, 51, 60).await, entries(51, 60, 1, 200));
+        assert!(read_all(&mut store, 1, 50).await.is_empty(), "purged entries are gone");
+        store.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn purge_everything_keeps_last_log_id() {
+        let io = FakeIo::new();
+        let mut store = open(&io, 1 << 16);
+        append_sync(&mut store, entries(1, 4, 1, 8)).await;
+        store.purge(log_id(1, 4)).await.unwrap();
+        let state = store.get_log_state().await.unwrap();
+        assert_eq!(state.last_purged_log_id, Some(log_id(1, 4)));
+        assert_eq!(state.last_log_id, Some(log_id(1, 4)));
+        store.shutdown().await;
+        let mut store = open(&io, 1 << 16);
+        let state = store.get_log_state().await.unwrap();
+        assert_eq!(state.last_purged_log_id, Some(log_id(1, 4)));
+        assert_eq!(state.last_log_id, Some(log_id(1, 4)));
+        // The next append continues contiguously after the purge point.
+        append_sync(&mut store, entries(5, 6, 1, 8)).await;
+        assert_eq!(read_all(&mut store, 1, 6).await, entries(5, 6, 1, 8));
+        store.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn append_visible_before_flush() {
+        let io = FakeIo::new();
+        io.set_sync_delay(Duration::from_millis(300));
+        let mut store = open(&io, 1 << 16);
+        let (cb, done) = signal();
+        let want = entries(1, 3, 1, 16);
+        store.append(want.clone(), cb).await.unwrap();
+        // The covering fsync is still sleeping inside FakeIo.
+        assert_eq!(io.stats().syncs, 0);
+        assert_eq!(read_all(&mut store, 1, 3).await, want);
+        done.await.unwrap();
+        assert!(io.stats().syncs >= 1);
+        store.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn append_empty_completes_callback() {
+        let io = FakeIo::new();
+        let mut store = open(&io, 1 << 16);
+        let (cb, done) = signal();
+        store.append(Vec::new(), cb).await.unwrap();
+        done.await.unwrap();
+        store.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn read_committed_roundtrip() {
+        let io = FakeIo::new();
+        let mut store = open(&io, 1 << 16);
+        assert_eq!(store.read_committed().await.unwrap(), None);
+        store.save_committed(Some(log_id(1, 7))).await.unwrap();
+        assert_eq!(store.read_committed().await.unwrap(), Some(log_id(1, 7)));
+        store.shutdown().await;
+        let mut store = open(&io, 1 << 16);
+        assert_eq!(store.read_committed().await.unwrap(), Some(log_id(1, 7)));
+        store.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn log_reader_serves_evicted_entries_from_disk() {
+        let io = FakeIo::new();
+        let config = WalConfig {
+            segment_size: 1 << 16,
+            cache_budget_bytes: 400,
+            ..WalConfig::default()
+        };
+        let mut store = WalLogStore::open_with_io(Box::new(io.clone()), config).unwrap();
+        let want = entries(1, 20, 1, 100);
+        append_sync(&mut store, want.clone()).await;
+        let cached = store.shared.read().cache.len();
+        assert!(cached < 20, "tiny budget must have evicted flushed entries, cached {cached}");
+        assert_eq!(read_all(&mut store, 1, 20).await, want);
+        store.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ring_full_backpressure_yields() {
+        let io = FakeIo::new();
+        io.set_sync_delay(Duration::from_millis(300));
+        let mut store = open(&io, 1 << 20);
+        let ticks = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let t = Arc::clone(&ticks);
+        let ticker = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                t.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        });
+        // More single-entry appends than the ring (8192) plus the writer's pending queue can hold
+        // while the first fsync sleeps.
+        let total = 12_000u64;
+        let mut last = None;
+        for i in 1..=total {
+            let cb = if i == total {
+                let (cb, done) = signal();
+                last = Some(done);
+                cb
+            } else {
+                IOFlushed::noop()
+            };
+            store.append(vec![entry(1, i, 8)], cb).await.unwrap();
+        }
+        last.unwrap().await.unwrap();
+        ticker.abort();
+        let n = ticks.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(n >= 10, "the runtime kept running while the ring was full (ticks {n})");
+        store.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn failed_store_rejects_ops_and_completes_callbacks_once() {
+        let io = FakeIo::new();
+        io.set_sync_delay(Duration::from_millis(20));
+        let mut store = open(&io, 1 << 16);
+        io.fail_next_sync();
+        let mut dones = Vec::new();
+        for i in 1..=3u64 {
+            let (cb, done) = signal();
+            store.append(vec![entry(1, i, 8)], cb).await.unwrap();
+            dones.push(done);
+        }
+        for done in dones {
+            assert!(done.await.is_err(), "every pending callback receives the failure");
+        }
+        let (cb, done) = signal();
+        assert!(store.append(vec![entry(1, 9, 8)], cb).await.is_err());
+        assert!(done.await.is_err(), "a rejected append still completes its callback");
+        assert!(store.save_vote(&vote(1, 1)).await.is_err());
+        assert!(store.truncate_after(Some(log_id(1, 1))).await.is_err());
+        assert!(store.purge(log_id(1, 1)).await.is_err());
+        store.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn acked_append_in_fresh_and_rolled_segments_survives_crash() {
+        // (a) one entry in a freshly created segment.
+        let io = FakeIo::new();
+        let mut store = open(&io, 4096);
+        append_sync(&mut store, entries(1, 1, 1, 16)).await;
+        io.crash(0);
+        drop(store);
+        io.revive();
+        let mut store = open(&io, 4096);
+        assert_eq!(store.get_log_state().await.unwrap().last_log_id, Some(log_id(1, 1)));
+        assert_eq!(read_all(&mut store, 1, 1).await, entries(1, 1, 1, 16));
+        store.shutdown().await;
+
+        // (b) the last acked entry lives in a rolled segment.
+        let io = FakeIo::new();
+        let mut store = open(&io, 4096);
+        let v = vote(4, 2);
+        store.save_vote(&v).await.unwrap();
+        append_sync(&mut store, entries(1, 100, 1, 100)).await;
+        assert!(seg_list(&io).len() >= 3, "rolled at least twice: {:?}", seg_list(&io));
+        io.crash(0);
+        drop(store);
+        io.revive();
+        let mut store = open(&io, 4096);
+        assert_eq!(store.get_log_state().await.unwrap().last_log_id, Some(log_id(1, 100)));
+        assert_eq!(read_all(&mut store, 1, 100).await, entries(1, 100, 1, 100));
+        assert_eq!(store.get_log_reader().await.read_vote().await.unwrap(), Some(v));
+        store.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn purge_crash_between_marker_and_deletions_reopens_cleanly() {
+        for n in [1usize, 2] {
+            let io = FakeIo::new();
+            let mut store = open(&io, 4096);
+            let v = vote(5, 3);
+            store.save_vote(&v).await.unwrap();
+            append_sync(&mut store, entries(1, 100, 1, 100)).await;
+            assert!(seg_list(&io).len() >= 4, "{:?}", seg_list(&io));
+
+            io.crash_before_nth_delete(n);
+            let _ = store.purge(log_id(1, 70)).await;
+            drop(store);
+            io.revive();
+
+            let mut store = open(&io, 4096);
+            let state = store.get_log_state().await.unwrap();
+            assert_eq!(state.last_purged_log_id, Some(log_id(1, 70)), "n={n}");
+            assert_eq!(state.last_log_id, Some(log_id(1, 100)), "n={n}");
+            assert_eq!(store.get_log_reader().await.read_vote().await.unwrap(), Some(v));
+            assert_eq!(read_all(&mut store, 71, 100).await, entries(71, 100, 1, 100), "n={n}");
+            assert_eq!(store.recovery_stats().torn_bytes_discarded, 0, "n={n}");
+            store.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn purge_marker_synced_before_first_delete_through_store() {
+        let io = FakeIo::new();
+        let mut store = open(&io, 4096);
+        append_sync(&mut store, entries(1, 100, 1, 100)).await;
+        let active = *seg_list(&io).last().unwrap();
+        io.record_events(true);
+        io.clear_events();
+        store.purge(log_id(1, 80)).await.unwrap();
+        let events = io.events();
+
+        let marker = events
+            .iter()
+            .position(|e| matches!(e, IoEvent::Write { seq, .. } if *seq == active))
+            .expect("purge marker written to the active segment");
+        let first_delete = events
+            .iter()
+            .position(|e| matches!(e, IoEvent::Delete { .. }))
+            .expect("purge deleted at least one segment");
+        let last_delete = events.iter().rposition(|e| matches!(e, IoEvent::Delete { .. })).unwrap();
+        let sync = events
+            .iter()
+            .enumerate()
+            .skip(marker)
+            .find(|(_, e)| matches!(e, IoEvent::SyncSegment { seq } if *seq == active))
+            .map(|(i, _)| i)
+            .expect("active segment synced after the marker");
+        assert!(marker < sync && sync < first_delete, "{events:?}");
+        assert!(
+            events.iter().skip(last_delete).any(|e| matches!(e, IoEvent::SyncDir)),
+            "directory synced after the last delete: {events:?}"
+        );
         store.shutdown().await;
     }
 }
