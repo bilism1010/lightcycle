@@ -78,6 +78,10 @@ pub struct TcpNetConfig {
     /// Snapshot transfer idle timeout (default 30 s): the longest either side waits for the
     /// next frame of an active transfer. It is a per-chunk bound, not a total.
     pub snapshot_idle_timeout: Duration,
+    /// Longest the sender waits for the install response after the last chunk (default 10 min).
+    /// The receiver validates the whole file twice before answering, which takes time
+    /// proportional to the snapshot size and is not a per-frame wait.
+    pub snapshot_install_timeout: Duration,
     /// Largest snapshot a receiver accepts, in bytes.
     pub max_snapshot_bytes: u64,
     /// Directory where received snapshot files are written.
@@ -98,6 +102,7 @@ impl TcpNetConfig {
             snapshot_chunk_size: 1024 * 1024,
             snapshot_ack_window: 4,
             snapshot_idle_timeout: Duration::from_secs(30),
+            snapshot_install_timeout: Duration::from_secs(600),
             max_snapshot_bytes: 8 * 1024 * 1024 * 1024,
             recv_dir,
         }
@@ -438,7 +443,8 @@ impl RaftNetworkV2<TypeConfig> for PeerClient {
     /// The file is read with positional reads off the async threads, sent as `SNAP_CHUNK`
     /// frames with at most `snapshot_ack_window` unacknowledged, and finished with `SNAP_END`;
     /// the receiver's `SNAP_RESP` is the result. Every wait is bounded by
-    /// `snapshot_idle_timeout` per frame (never a total), and the whole transfer races the
+    /// `snapshot_idle_timeout` per frame (never a total), except the wait for the install
+    /// response after `SNAP_END`, which gets `snapshot_install_timeout`; the whole transfer races the
     /// `cancel` future. Any failure or cancellation drops the connection (the receiver then
     /// removes its partial file) and the next call dials afresh.
     async fn full_snapshot(
@@ -512,11 +518,15 @@ async fn read_chunk(file: Arc<std::fs::File>, offset: u64, len: usize) -> std::i
 
 impl PeerClient {
     fn snapshot_timeout(&self) -> StreamingError<TypeConfig> {
+        self.snapshot_timeout_after(self.cfg.snapshot_idle_timeout)
+    }
+
+    fn snapshot_timeout_after(&self, timeout: Duration) -> StreamingError<TypeConfig> {
         StreamingError::Timeout(openraft::errors::Timeout {
             action: RPCTypes::InstallSnapshot,
             id: self.cfg.node_id,
             target: self.target,
-            timeout: self.cfg.snapshot_idle_timeout,
+            timeout,
         })
     }
 
@@ -540,8 +550,18 @@ impl PeerClient {
         conn: &mut SnapConn,
         id: u64,
     ) -> Result<Frame, StreamingError<TypeConfig>> {
-        let frame = match tokio::time::timeout(self.cfg.snapshot_idle_timeout, conn.next()).await {
-            Err(_) => return Err(self.snapshot_timeout()),
+        self.snap_recv_within(conn, id, self.cfg.snapshot_idle_timeout).await
+    }
+
+    /// [`snap_recv`](Self::snap_recv) with an explicit bound.
+    async fn snap_recv_within(
+        &self,
+        conn: &mut SnapConn,
+        id: u64,
+        bound: Duration,
+    ) -> Result<Frame, StreamingError<TypeConfig>> {
+        let frame = match tokio::time::timeout(bound, conn.next()).await {
+            Err(_) => return Err(self.snapshot_timeout_after(bound)),
             Ok(None) => return Err(unreachable_err("connection closed by peer").into()),
             Ok(Some(Err(e))) => return Err(frame_err(e).into()),
             Ok(Some(Ok(frame))) => frame,
@@ -633,9 +653,13 @@ impl PeerClient {
 
         self.snap_send(&mut conn, Frame::new(SNAP_END, lane, id, Bytes::new()))
             .await?;
-        // The remaining acknowledgements precede the response; skip them.
+        // The remaining acknowledgements precede the response; skip them. The response only
+        // comes after the receiver has validated and installed the whole file, so it gets the
+        // install bound and not the per-frame idle bound.
         loop {
-            let frame = self.snap_recv(&mut conn, id).await?;
+            let frame = self
+                .snap_recv_within(&mut conn, id, self.cfg.snapshot_install_timeout)
+                .await?;
             match frame.header.kind {
                 SNAP_ACK => continue,
                 SNAP_RESP => {

@@ -1792,6 +1792,35 @@ async fn heartbeat_lane_pipelines_like_replication() {
     server.shutdown().await;
 }
 
+#[tokio::test]
+async fn slow_install_is_not_cut_off_by_the_per_frame_idle_timeout() {
+    // The install itself (validation of the whole file) takes longer than the per-frame idle
+    // bound; the sender must wait for the response under the install bound instead.
+    let td = tempfile::tempdir().unwrap();
+    let recv_dir = td.path().join("recv");
+    let src = make_file(td.path(), "snap.bin", 64 * 1024);
+    let stub = Arc::new(StubHandler {
+        install_delay: Duration::from_millis(900),
+        ..Default::default()
+    });
+    let server = start_server(stub.clone(), |cfg| {
+        cfg.recv_dir = recv_dir.clone();
+        cfg.snapshot_idle_timeout = Duration::from_millis(300);
+        cfg.snapshot_chunk_size = 16 * 1024;
+        cfg.snapshot_ack_window = 2;
+    })
+    .await;
+    let mut cfg = snap_cfg(CLIENT_NODE, &recv_dir, 16 * 1024, 2, Duration::from_millis(300));
+    cfg.snapshot_install_timeout = Duration::from_secs(10);
+    let mut peer = client(&server, cfg, Lane::Snapshot).await;
+
+    peer.full_snapshot(snap_vote(), snapshot_of(src), never_cancelled(), opt())
+        .await
+        .expect("a slow install within the install bound succeeds");
+    assert_eq!(stub.install_calls.load(Ordering::SeqCst), 1);
+    server.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn snapshot_does_not_starve_heartbeat() {
     let td = tempfile::tempdir().unwrap();
