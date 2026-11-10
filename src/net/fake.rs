@@ -337,12 +337,17 @@ async fn deliver_snapshot(
     let n = ctl.next_snapshot_seq();
     let dest = routed.recv_dir.join(format!("recv-{n}.tmp"));
     let len = std::fs::copy(&snapshot.snapshot.path, &dest).map_err(io_err)?;
-    let file = SnapshotFile { path: dest, len };
-    routed
+    let file = SnapshotFile { path: dest.clone(), len };
+    let result = routed
         .handler
         .install_snapshot(vote, snapshot.meta, file)
         .await
-        .map_err(|e| StreamingError::Unreachable(Unreachable::new(&e)))
+        .map_err(|e| StreamingError::Unreachable(Unreachable::new(&e)));
+    // Like the real server's `TmpGuard`: whatever the handler left of the received copy (it
+    // renames the file away on install, but a stale or failed one stays) is removed, so a test
+    // cannot pass over a leaked receive file the real transport would not leave.
+    let _ = std::fs::remove_file(&dest);
+    result
 }
 
 impl RaftNetworkV2<TypeConfig> for FakePeer {
