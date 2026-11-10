@@ -352,24 +352,33 @@ async fn kill_restart_keeps_committed_writes() {
     cluster.assert_contain_and_identical(&[1, 2, 3], &acked).await;
 
     // Crash 2: the leader, torn after 301 unsynced bytes, while writes continue through the
-    // survivor that wins the next election.
-    let leader = cluster.leader().await;
-    let writer = cluster.spawn_writer("bg2");
-    writer.wait_acked(5).await;
-    cluster.crash_with_unsynced_tail(leader, 301).await;
-    let survivors: Vec<u64> = (1..=3).filter(|id| *id != leader).collect();
-    let new_leader = cluster.leader_among(&survivors).await;
-    assert_ne!(new_leader, leader);
-    let progress = writer.acked();
-    writer.wait_acked(progress + 5).await;
-    acked.extend(writer.stop().await);
+    // survivor that wins the next election. The tear must be proven for the leader itself: 301
+    // bytes can in principle end exactly on a record boundary (a clean log), so that rare case
+    // retries the crash instead of weakening the assertion.
+    let mut second = None;
+    for attempt in 0..5 {
+        let leader = cluster.leader().await;
+        let writer = cluster.spawn_writer(&format!("bg2-{attempt}"));
+        writer.wait_acked(5).await;
+        cluster.crash_with_unsynced_tail(leader, 301).await;
+        let survivors: Vec<u64> = (1..=3).filter(|id| *id != leader).collect();
+        let new_leader = cluster.leader_among(&survivors).await;
+        assert_ne!(new_leader, leader);
+        let progress = writer.acked();
+        writer.wait_acked(progress + 5).await;
+        acked.extend(writer.stop().await);
 
-    cluster.restart(leader).await;
-    let second = cluster.node(leader).recovery_stats();
-    let torn_total = first.torn_bytes_discarded + second.torn_bytes_discarded;
+        cluster.restart(leader).await;
+        let stats = cluster.node(leader).recovery_stats();
+        if stats.torn_bytes_discarded > 0 {
+            second = Some(stats);
+            break;
+        }
+    }
+    let second = second.expect("no leader crash in 5 attempts left a torn tail to discard");
     assert!(
-        torn_total > 0,
-        "torn tails must have been discarded: first {first:?}, second {second:?}"
+        second.torn_bytes_discarded > 0,
+        "leader restart must have discarded a torn tail: {second:?}"
     );
 
     // Every acknowledged write is on all three nodes, and the nodes are identical (a write that
