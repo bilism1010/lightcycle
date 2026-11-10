@@ -127,6 +127,9 @@ impl Frame {
 pub struct FrameCodec {
     inner: LengthDelimitedCodec,
     max_frame_length: usize,
+    /// True once the inner codec has consumed a length prefix but not yet produced its frame, so
+    /// `src` no longer starts with a prefix and the cap check must not be repeated.
+    mid_frame: bool,
 }
 
 impl FrameCodec {
@@ -140,6 +143,7 @@ impl FrameCodec {
         FrameCodec {
             inner,
             max_frame_length,
+            mid_frame: false,
         }
     }
 
@@ -162,7 +166,10 @@ impl Decoder for FrameCodec {
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Frame>, FrameError> {
         // Check the declared length ourselves so the error carries the declared size and fires
         // from the prefix alone, before the inner codec reserves any body capacity.
-        if src.len() >= LENGTH_PREFIX_LEN {
+        // The inner codec consumes the prefix as soon as it has 4 bytes and then waits for the body,
+        // so on a retry with a partial body `src` starts with body bytes, not a prefix.
+        let starts_with_prefix = !self.mid_frame && src.len() >= LENGTH_PREFIX_LEN;
+        if starts_with_prefix {
             let declared =
                 u32::from_be_bytes([src[0], src[1], src[2], src[3]]) as usize;
             if declared > self.max_frame_length {
@@ -173,8 +180,10 @@ impl Decoder for FrameCodec {
             }
         }
         let Some(mut payload) = self.inner.decode(src)? else {
+            self.mid_frame = self.mid_frame || starts_with_prefix;
             return Ok(None);
         };
+        self.mid_frame = false;
         if payload.len() < HEADER_LEN {
             return Err(FrameError::Truncated);
         }
@@ -266,6 +275,33 @@ mod tests {
         for f in &frames {
             let got = rx.next().await.unwrap().unwrap();
             assert_eq!(&got, f);
+        }
+    }
+
+    #[test]
+    fn frame_split_across_partial_reads_decodes() {
+        // Regression: after the prefix was consumed, a retry with a partial body must not
+        // re-interpret body bytes as a length prefix.
+        let mut enc = FrameCodec::new(1 << 20);
+        let frames: Vec<Frame> = (0..4u64)
+            .map(|i| Frame::new(KIND_APP_BASE, Lane::Replication, i, Bytes::from(vec![0xFFu8; 300 * (i as usize + 1)])))
+            .collect();
+        let mut wire = BytesMut::new();
+        for f in &frames {
+            enc.encode(f.clone(), &mut wire).unwrap();
+        }
+        for step in [1usize, 3, 7, 100] {
+            let mut dec = FrameCodec::new(1 << 20);
+            let mut buf = BytesMut::new();
+            let mut got = Vec::new();
+            for chunk in wire.chunks(step) {
+                buf.extend_from_slice(chunk);
+                while let Some(f) = dec.decode(&mut buf).unwrap() {
+                    got.push(f);
+                }
+            }
+            assert_eq!(got, frames, "step {step}");
+            assert!(buf.is_empty());
         }
     }
 
