@@ -12,6 +12,7 @@
 //! stopped, `Unreachable`. After any error the connection is dropped and the next call
 //! reconnects; no resynchronization is ever attempted.
 
+use std::collections::VecDeque;
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -27,14 +28,18 @@ use openraft::raft::{
     AppendEntriesRequest, AppendResult, SnapshotResponse, VoteRequest, VoteResponse,
 };
 use openraft::type_config::alias::{SnapshotOf, VoteOf};
-use openraft::{BasicNode, OptionalSend, RaftNetworkFactory, RaftNetworkV2};
+use openraft::{
+    BasicNode, ErrorSubject, ErrorVerb, OptionalSend, RaftNetworkFactory, RaftNetworkV2,
+    StorageError,
+};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use tokio_util::codec::Framed;
 
 use crate::net::protocol::{
-    decode_body, encode_body, AbortOnDrop, ProtocolError, RemoteFailure, WireAppendResult,
-    APPEND_REQ, APPEND_RESP, PREVOTE_REQ, PREVOTE_RESP, VOTE_REQ, VOTE_RESP,
+    decode_body, encode_body, AbortOnDrop, ProtocolError, RemoteFailure, SnapAck, SnapBegin,
+    WireAppendResult, APPEND_REQ, APPEND_RESP, PREVOTE_REQ, PREVOTE_RESP, SNAP_ACK, SNAP_BEGIN,
+    SNAP_CHUNK, SNAP_END, SNAP_RESP, VOTE_REQ, VOTE_RESP,
 };
 use crate::raft::types::{SnapshotFile, TypeConfig};
 use crate::wire::frame::{Frame, FrameCodec, FrameError, Lane, HEADER_LEN, KIND_ERROR};
@@ -62,15 +67,20 @@ pub struct TcpNetConfig {
     pub inflight_requests: usize,
     /// Maximum request body bytes in flight on one pipelined connection (default 8 MiB).
     pub inflight_bytes: usize,
-    /// Snapshot chunk size (default 1 MiB); used by plan 03-17.
+    /// Snapshot chunk size (default 1 MiB). It also sets the snapshot lane's frame cap, so a
+    /// sender never uses a chunk larger than this even if openraft recommends one.
     pub snapshot_chunk_size: usize,
-    /// Unacknowledged snapshot chunks allowed in flight (default 4); used by plan 03-17.
+    /// Snapshot chunks per acknowledgement (default 4): the receiver acknowledges every this many
+    /// chunks and the sender never has more than this many unacknowledged. Both ends must use
+    /// the same value (a sender window smaller than the receiver's stalls until the idle
+    /// timeout).
     pub snapshot_ack_window: usize,
-    /// Snapshot transfer idle timeout (default 30 s); used by plan 03-17.
+    /// Snapshot transfer idle timeout (default 30 s): the longest either side waits for the
+    /// next frame of an active transfer. It is a per-chunk bound, not a total.
     pub snapshot_idle_timeout: Duration,
-    /// Largest snapshot a receiver accepts, in bytes; used by plan 03-17.
+    /// Largest snapshot a receiver accepts, in bytes.
     pub max_snapshot_bytes: u64,
-    /// Directory where received snapshot files are written; used by plan 03-17.
+    /// Directory where received snapshot files are written.
     pub recv_dir: PathBuf,
 }
 
@@ -408,17 +418,224 @@ impl RaftNetworkV2<TypeConfig> for PeerClient {
         self.vote_call(PREVOTE_REQ, PREVOTE_RESP, rpc, &option).await
     }
 
+    /// Chunked snapshot transfer on the snapshot lane (decisions D-11, D-12).
+    ///
+    /// The file is read with positional reads off the async threads, sent as `SNAP_CHUNK`
+    /// frames with at most `snapshot_ack_window` unacknowledged, and finished with `SNAP_END`;
+    /// the receiver's `SNAP_RESP` is the result. Every wait is bounded by
+    /// `snapshot_idle_timeout` per frame (never a total), and the whole transfer races the
+    /// `cancel` future. Any failure or cancellation drops the connection (the receiver then
+    /// removes its partial file) and the next call dials afresh.
     async fn full_snapshot(
         &mut self,
-        _vote: VoteOf<TypeConfig>,
-        _snapshot: SnapshotOf<TypeConfig, Self::SnapshotData>,
-        _cancel: impl Future<Output = ReplicationClosed> + OptionalSend + 'static,
-        _option: RPCOption,
+        vote: VoteOf<TypeConfig>,
+        snapshot: SnapshotOf<TypeConfig, Self::SnapshotData>,
+        cancel: impl Future<Output = ReplicationClosed> + OptionalSend + 'static,
+        option: RPCOption,
     ) -> Result<SnapshotResponse<TypeConfig>, StreamingError<TypeConfig>> {
-        // The chunked snapshot lane is delivered by plan 03-17.
-        Err(StreamingError::Unreachable(Unreachable::from_string(
-            "snapshot transfer not implemented yet",
-        )))
+        let cap = self.cfg.snapshot_chunk_size.max(1);
+        let chunk_size = option.snapshot_chunk_size().unwrap_or(cap).clamp(1, cap);
+        let transfer = self.snapshot_transfer(vote, snapshot, chunk_size);
+        tokio::pin!(transfer);
+        tokio::pin!(cancel);
+        tokio::select! {
+            biased;
+            closed = &mut cancel => Err(StreamingError::Closed(closed)),
+            result = &mut transfer => result,
+        }
+    }
+}
+
+type SnapConn = Framed<TcpStream, FrameCodec>;
+
+fn stream_net_err(msg: impl ToString) -> StreamingError<TypeConfig> {
+    StreamingError::Network(NetworkError::new(&std::io::Error::other(msg.to_string())))
+}
+
+fn snapshot_read_err(e: std::io::Error) -> StreamingError<TypeConfig> {
+    StreamingError::StorageError(StorageError::from_io_error(
+        ErrorSubject::Snapshot(None),
+        ErrorVerb::Read,
+        e,
+    ))
+}
+
+/// Read exactly `buf.len()` bytes at `offset` without moving a shared file cursor.
+fn pread_exact(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        file.read_exact_at(buf, offset)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        let mut done = 0usize;
+        while done < buf.len() {
+            let n = file.seek_read(&mut buf[done..], offset + done as u64)?;
+            if n == 0 {
+                return Err(std::io::ErrorKind::UnexpectedEof.into());
+            }
+            done += n;
+        }
+        Ok(())
+    }
+}
+
+/// Read one `SNAP_CHUNK` body (8-byte big-endian offset, then the raw bytes) off the async
+/// threads. The layout is that of `protocol::encode_snap_chunk`, built in place to avoid a copy.
+async fn read_chunk(file: Arc<std::fs::File>, offset: u64, len: usize) -> std::io::Result<Bytes> {
+    tokio::task::spawn_blocking(move || {
+        let mut buf = vec![0u8; 8 + len];
+        buf[..8].copy_from_slice(&offset.to_be_bytes());
+        pread_exact(&file, &mut buf[8..], offset)?;
+        Ok(Bytes::from(buf))
+    })
+    .await
+    .map_err(std::io::Error::other)?
+}
+
+impl PeerClient {
+    fn snapshot_timeout(&self) -> StreamingError<TypeConfig> {
+        StreamingError::Timeout(openraft::errors::Timeout {
+            action: RPCTypes::InstallSnapshot,
+            id: self.cfg.node_id,
+            target: self.target,
+            timeout: self.cfg.snapshot_idle_timeout,
+        })
+    }
+
+    /// Send one frame, bounded by the idle timeout.
+    async fn snap_send(
+        &self,
+        conn: &mut SnapConn,
+        frame: Frame,
+    ) -> Result<(), StreamingError<TypeConfig>> {
+        match tokio::time::timeout(self.cfg.snapshot_idle_timeout, conn.send(frame)).await {
+            Err(_) => Err(self.snapshot_timeout()),
+            Ok(Err(e)) => Err(frame_err(e).into()),
+            Ok(Ok(())) => Ok(()),
+        }
+    }
+
+    /// Receive the next frame of transfer `id`, bounded by the idle timeout. A `KIND_ERROR`
+    /// frame from the receiver is turned into its error here.
+    async fn snap_recv(
+        &self,
+        conn: &mut SnapConn,
+        id: u64,
+    ) -> Result<Frame, StreamingError<TypeConfig>> {
+        let frame = match tokio::time::timeout(self.cfg.snapshot_idle_timeout, conn.next()).await {
+            Err(_) => return Err(self.snapshot_timeout()),
+            Ok(None) => return Err(unreachable_err("connection closed by peer").into()),
+            Ok(Some(Err(e))) => return Err(frame_err(e).into()),
+            Ok(Some(Ok(frame))) => frame,
+        };
+        if frame.header.req_id != id {
+            return Err(stream_net_err(format!(
+                "snapshot frame req_id {} does not match transfer {}",
+                frame.header.req_id, id
+            )));
+        }
+        if frame.header.kind == KIND_ERROR {
+            return Err(remote_failure_err(&RemoteFailure::decode(&frame.body)).into());
+        }
+        Ok(frame)
+    }
+
+    /// The transfer proper; `conn` is a local, so dropping this future (cancel) closes it.
+    async fn snapshot_transfer(
+        &mut self,
+        vote: VoteOf<TypeConfig>,
+        snapshot: SnapshotOf<TypeConfig, SnapshotFile>,
+        chunk_size: usize,
+    ) -> Result<SnapshotResponse<TypeConfig>, StreamingError<TypeConfig>> {
+        let SnapshotFile {
+            path,
+            len: total_len,
+        } = snapshot.snapshot;
+        let meta = snapshot.meta;
+        let file = tokio::fs::File::open(&path)
+            .await
+            .map_err(snapshot_read_err)?
+            .into_std()
+            .await;
+        let file = Arc::new(file);
+
+        self.ensure_conn(RPCTypes::InstallSnapshot).await?;
+        let id = self.next_req_id;
+        self.next_req_id = self.next_req_id.wrapping_add(1);
+        let lane = self.lane;
+        let mut conn = self
+            .conn
+            .take()
+            .expect("ensure_conn established a connection");
+
+        let begin = SnapBegin {
+            vote,
+            meta,
+            total_len,
+        };
+        let body = encode_body(&begin).map_err(stream_net_err)?;
+        self.snap_send(&mut conn, Frame::new(SNAP_BEGIN, lane, id, body))
+            .await?;
+
+        let window = self.cfg.snapshot_ack_window.max(1);
+        let mut offset = 0u64;
+        // End offsets of chunks sent but not yet acknowledged.
+        let mut outstanding: VecDeque<u64> = VecDeque::new();
+        while offset < total_len {
+            // Backpressure: wait for acknowledgements before exceeding the window.
+            while outstanding.len() >= window {
+                let frame = self.snap_recv(&mut conn, id).await?;
+                if frame.header.kind != SNAP_ACK {
+                    return Err(stream_net_err(format!(
+                        "unexpected frame kind {} while awaiting snapshot ack",
+                        frame.header.kind
+                    )));
+                }
+                let ack: SnapAck = decode_body(&frame.body).map_err(stream_net_err)?;
+                let before = outstanding.len();
+                while outstanding.front().is_some_and(|end| *end <= ack.written) {
+                    outstanding.pop_front();
+                }
+                if ack.written > offset || outstanding.len() == before {
+                    return Err(stream_net_err(format!(
+                        "snapshot ack for {} bytes does not match {} bytes sent",
+                        ack.written, offset
+                    )));
+                }
+            }
+            let len = (total_len - offset).min(chunk_size as u64) as usize;
+            let body = read_chunk(file.clone(), offset, len)
+                .await
+                .map_err(snapshot_read_err)?;
+            self.snap_send(&mut conn, Frame::new(SNAP_CHUNK, lane, id, body))
+                .await?;
+            offset += len as u64;
+            outstanding.push_back(offset);
+        }
+
+        self.snap_send(&mut conn, Frame::new(SNAP_END, lane, id, Bytes::new()))
+            .await?;
+        // The remaining acknowledgements precede the response; skip them.
+        loop {
+            let frame = self.snap_recv(&mut conn, id).await?;
+            match frame.header.kind {
+                SNAP_ACK => continue,
+                SNAP_RESP => {
+                    let resp: SnapshotResponse<TypeConfig> =
+                        decode_body(&frame.body).map_err(stream_net_err)?;
+                    self.conn = Some(conn);
+                    return Ok(resp);
+                }
+                other => {
+                    return Err(stream_net_err(format!(
+                        "unexpected frame kind {other} in snapshot response"
+                    )))
+                }
+            }
+        }
     }
 }
 
