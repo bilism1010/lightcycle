@@ -80,6 +80,14 @@ pub enum HandshakeError {
         /// Node id the caller meant to reach.
         expected: u64,
     },
+    /// The server answered for a different lane than the one requested.
+    #[error("lane mismatch: server answered for {theirs:?}, requested {ours:?}")]
+    LaneMismatch {
+        /// Lane the server's Hello names.
+        theirs: Lane,
+        /// Lane this client asked for.
+        ours: Lane,
+    },
     /// The peer announced this node's own id: a self-dial or a mis-wired membership.
     #[error("peer announced this node's own id {0}")]
     SelfDial(u64),
@@ -276,8 +284,11 @@ where
                         });
                     }
                 }
-                if expected_node_id.is_some() && theirs.lane != hello.lane {
-                    return Err(HandshakeError::UnexpectedFrame);
+                if theirs.lane != hello.lane {
+                    return Err(HandshakeError::LaneMismatch {
+                        theirs: theirs.lane,
+                        ours: hello.lane,
+                    });
                 }
                 Ok(theirs)
             }
@@ -355,6 +366,30 @@ mod tests {
             server_handshake(&mut s, 42, 9, T)
         );
         assert_eq!(cr.unwrap().node_id, 9);
+    }
+
+    #[tokio::test]
+    async fn client_rejects_a_server_that_answers_for_another_lane() {
+        // With and without an expected node id: the lane check does not depend on it.
+        for expected in [Some(9), None] {
+            let (mut c, mut s) = pair();
+            let hello = Hello::new(42, 7, Lane::Replication);
+            let server = async {
+                let first = s.next().await.unwrap().unwrap();
+                let ours = Hello::new(42, 9, Lane::Snapshot);
+                s.send(Frame::new(KIND_HELLO_ACK, Lane::Snapshot, first.header.req_id, ours.encode()))
+                    .await
+                    .unwrap();
+            };
+            let (cr, ()) =
+                tokio::join!(client_handshake_expecting(&mut c, hello, expected, T), server);
+            match cr {
+                Err(HandshakeError::LaneMismatch { theirs, ours }) => {
+                    assert_eq!((theirs, ours), (Lane::Snapshot, Lane::Replication));
+                }
+                other => panic!("expected LaneMismatch for {expected:?}, got {other:?}"),
+            }
+        }
     }
 
     #[tokio::test]
