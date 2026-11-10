@@ -354,6 +354,26 @@ async fn wrong_node_at_the_dialed_address_is_rejected_over_tcp() {
 }
 
 #[tokio::test]
+async fn silent_heartbeat_connection_is_closed_after_the_idle_bound() {
+    let stub = Arc::new(StubHandler::default());
+    let server = start_server(stub, |cfg| {
+        cfg.heartbeat_idle_timeout = Duration::from_millis(200);
+    })
+    .await;
+
+    // Handshaken but then silent: no heartbeat ever arrives.
+    let mut silent = raw_conn(&server, Lane::Heartbeat).await;
+    expect_closed(&mut silent).await;
+
+    // The replication lane has no such bound (it is legitimately quiet between writes).
+    let mut quiet = raw_conn(&server, Lane::Replication).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let still_open = tokio::time::timeout(Duration::from_millis(100), quiet.next()).await;
+    assert!(still_open.is_err(), "an idle replication connection stays open");
+    server.shutdown().await;
+}
+
+#[tokio::test]
 async fn handshake_timeout_closes_silent_connection() {
     let stub = Arc::new(StubHandler::default());
     let server = start_server(stub, |cfg| {

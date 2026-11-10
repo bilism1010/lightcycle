@@ -181,6 +181,7 @@ async fn serve_connection(
     cancel: CancellationToken,
 ) {
     let _ = socket.set_nodelay(true);
+    cfg.apply_keepalive(&socket);
     let mut framed = Framed::new(socket, FrameCodec::new(PRE_HELLO_FRAME_CAP));
     let hello = match server_handshake(
         &mut framed,
@@ -210,11 +211,24 @@ async fn serve_connection(
 }
 
 /// Drain the connection's outgoing queue into the socket; cancels the connection on exit.
-async fn writer_task(mut sink: ConnSink, mut rx: mpsc::Receiver<Frame>, cancel: CancellationToken) {
+///
+/// Each frame must be accepted by the socket within `write_timeout`: a peer that stopped reading
+/// would otherwise park this task, fill the queue and wedge the whole connection forever.
+async fn writer_task(
+    mut sink: ConnSink,
+    mut rx: mpsc::Receiver<Frame>,
+    cancel: CancellationToken,
+    write_timeout: Duration,
+) {
     let _guard = cancel.drop_guard();
     while let Some(frame) = rx.recv().await {
-        if sink.send(frame).await.is_err() {
-            break;
+        match tokio::time::timeout(write_timeout, sink.send(frame)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => break,
+            Err(_) => {
+                tracing::debug!("peer stopped reading; closing connection");
+                break;
+            }
         }
     }
 }
@@ -347,7 +361,12 @@ async fn run_lane(
     // the guard below does on every exit path.
     let conn_cancel = cancel.child_token();
     let _conn_guard = conn_cancel.clone().drop_guard();
-    let mut writer = AbortOnDrop(tokio::spawn(writer_task(sink, out_rx, conn_cancel.clone())));
+    let mut writer = AbortOnDrop(tokio::spawn(writer_task(
+        sink,
+        out_rx,
+        conn_cancel.clone(),
+        cfg.write_timeout,
+    )));
     let unary_slots = Arc::new(Semaphore::new(cfg.inflight_requests.max(1)));
     let mut append: Option<AppendSession> = None;
 
@@ -355,7 +374,17 @@ async fn run_lane(
         let next = tokio::select! {
             biased;
             _ = conn_cancel.cancelled() => break,
-            next = stream.next() => next,
+            next = async {
+                if lane == Lane::Heartbeat {
+                    // A live peer heartbeats far more often than this; silence means the peer
+                    // is gone without a FIN (the keepalive is the second line of defense).
+                    tokio::time::timeout(cfg.heartbeat_idle_timeout, stream.next())
+                        .await
+                        .unwrap_or(None)
+                } else {
+                    stream.next().await
+                }
+            } => next,
         };
         let frame = match next {
             None => break,

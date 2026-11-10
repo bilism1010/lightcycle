@@ -911,6 +911,7 @@ dependencies = [
  "postcard",
  "proptest",
  "serde",
+ "socket2",
  "tempfile",
  "thiserror",
  "tokio",

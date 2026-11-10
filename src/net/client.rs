@@ -84,6 +84,16 @@ pub struct TcpNetConfig {
     pub snapshot_install_timeout: Duration,
     /// Largest snapshot a receiver accepts, in bytes.
     pub max_snapshot_bytes: u64,
+    /// TCP keepalive idle time on dialed and accepted sockets (default 30 s; zero disables). A
+    /// peer host that vanished without a FIN or RST is then detected instead of leaking its
+    /// connection state forever.
+    pub keepalive_time: Duration,
+    /// Longest the server spends writing one frame to a peer that has stopped reading (default
+    /// 30 s); the connection is closed when it expires.
+    pub write_timeout: Duration,
+    /// Longest the server waits for any frame on a heartbeat-lane connection (default 60 s).
+    /// A live peer sends heartbeats far more often; a silent one is closed.
+    pub heartbeat_idle_timeout: Duration,
     /// Directory where received snapshot files are written.
     pub recv_dir: PathBuf,
 }
@@ -104,7 +114,24 @@ impl TcpNetConfig {
             snapshot_idle_timeout: Duration::from_secs(30),
             snapshot_install_timeout: Duration::from_secs(600),
             max_snapshot_bytes: 8 * 1024 * 1024 * 1024,
+            keepalive_time: Duration::from_secs(30),
+            write_timeout: Duration::from_secs(30),
+            heartbeat_idle_timeout: Duration::from_secs(60),
             recv_dir,
+        }
+    }
+
+    /// Enables TCP keepalive on `stream` per [`keepalive_time`](Self::keepalive_time). Failure is
+    /// logged, not fatal: keepalive is a defense in depth.
+    pub(crate) fn apply_keepalive(&self, stream: &TcpStream) {
+        if self.keepalive_time.is_zero() {
+            return;
+        }
+        let keepalive = socket2::TcpKeepalive::new()
+            .with_time(self.keepalive_time)
+            .with_interval((self.keepalive_time / 3).max(Duration::from_secs(1)));
+        if let Err(e) = socket2::SockRef::from(stream).set_tcp_keepalive(&keepalive) {
+            tracing::debug!(error = %e, "could not enable tcp keepalive");
         }
     }
 
@@ -231,6 +258,7 @@ impl PeerClient {
             Ok(Ok(stream)) => stream,
         };
         let _ = stream.set_nodelay(true);
+        self.cfg.apply_keepalive(&stream);
         let mut framed = Framed::new(stream, FrameCodec::new(PRE_HELLO_FRAME_CAP));
         let hello = Hello::new(self.cfg.cluster_id, self.cfg.node_id, self.lane);
         // The server's Hello must name the node this client targets: a stale or wrong membership
@@ -807,5 +835,31 @@ impl ResponseReader {
                 "unexpected frame kind {other} in append response"
             )))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn keepalive_is_enabled_on_sockets_the_config_touches() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stream = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (accepted, _) = listener.accept().await.unwrap();
+        let cfg = TcpNetConfig::new(1, 1, PathBuf::new());
+
+        for socket in [&stream, &accepted] {
+            assert!(!socket2::SockRef::from(socket).keepalive().unwrap());
+            cfg.apply_keepalive(socket);
+            assert!(socket2::SockRef::from(socket).keepalive().unwrap());
+        }
+
+        let mut off = cfg.clone();
+        off.keepalive_time = Duration::ZERO;
+        let fresh = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        off.apply_keepalive(&fresh);
+        assert!(!socket2::SockRef::from(&fresh).keepalive().unwrap());
     }
 }
