@@ -186,6 +186,94 @@ impl KvIndex {
         }
     }
 
+    /// Delete `key` as Raft entry `index`: swaps in a tombstone stamped
+    /// `index` (even over an existing tombstone), unless the key's stamp is
+    /// already at or above `index`. A key with no slot is a no-op (no slot is
+    /// created) and counts as `Applied`.
+    pub fn delete_at(&self, key: &[u8], index: u64) -> AtStatus {
+        let Some(entry) = self.map.get(key) else {
+            return AtStatus::Applied;
+        };
+        let slot = &entry.value().cell;
+        let guard = epoch::pin();
+        let mut new = Owned::new(Versioned { index, value: None });
+        loop {
+            let cur = slot.load(Acquire, &guard);
+            // SAFETY: protected by `guard`.
+            if let Some(c) = unsafe { cur.as_ref() } {
+                if c.index >= index {
+                    return AtStatus::Skipped;
+                }
+            }
+            match slot.compare_exchange(cur, new, AcqRel, Acquire, &guard) {
+                Ok(_) => {
+                    if !cur.is_null() {
+                        // SAFETY: `cur` was unlinked by our successful CAS.
+                        unsafe { guard.defer_destroy(cur) };
+                    }
+                    return AtStatus::Applied;
+                }
+                Err(e) => new = e.new,
+            }
+        }
+    }
+
+    /// Compare-and-swap as Raft entry `index`. Returns `Skipped` (before
+    /// evaluating `expected`) if the key's stamp is at or above `index`. A
+    /// mismatch returns `Err` and leaves value and stamp untouched; success
+    /// stamps `index` (`desired = None` writes a stamped tombstone).
+    pub fn cas_at(
+        &self,
+        key: &[u8],
+        expected: Option<&[u8]>,
+        desired: Option<Bytes>,
+        index: u64,
+    ) -> Result<AtStatus, CasError> {
+        self.cas_inner(key, expected, desired, index, true)
+    }
+
+    /// Visit every key's `(value, stamp)` for a snapshot. Tombstones whose
+    /// stamp is at or below `drop_tombstones_at_or_below` are omitted; newer
+    /// tombstones are yielded (`value == None`). Never-written slots are
+    /// skipped.
+    ///
+    /// Each key is read under its own short epoch pin that is dropped before
+    /// the callback runs, so no pin is held across the scan or inside `f`
+    /// (NFR-4): writes, including from inside `f`, are allowed and the scan
+    /// is a fuzzy (non-atomic) view, which the stamps make safe to replay.
+    pub fn scan_versioned(&self, drop_tombstones_at_or_below: u64, mut f: impl FnMut(VersionedEntry)) {
+        for entry in self.map.iter() {
+            let (value, stamp) = {
+                let guard = epoch::pin();
+                let p = entry.value().cell.load(Acquire, &guard);
+                // SAFETY: protected by `guard`, which ends with this block.
+                match unsafe { p.as_ref() } {
+                    None => continue,
+                    Some(c) => (c.value.clone(), c.index),
+                }
+            };
+            if value.is_none() && stamp <= drop_tombstones_at_or_below {
+                continue;
+            }
+            f(VersionedEntry { key: entry.key().clone(), value, stamp });
+        }
+    }
+
+    /// Install `(value, stamp)` for `key` unconditionally (`None` = tombstone).
+    /// For single-threaded restore of a snapshot into a fresh index.
+    pub fn load_versioned(&self, key: &[u8], value: Option<Bytes>, stamp: u64) {
+        let entry = self.map.get_or_insert_with(Bytes::copy_from_slice(key), Slot::empty);
+        let guard = epoch::pin();
+        let old = entry
+            .value()
+            .cell
+            .swap(Owned::new(Versioned { index: stamp, value }), AcqRel, &guard);
+        if !old.is_null() {
+            // SAFETY: `old` was unlinked by the swap; no new reader can reach it.
+            unsafe { guard.defer_destroy(old) };
+        }
+    }
+
     /// Atomically replace the value of `key` with `desired` if its current
     /// value equals `expected` (`None` = absent). `desired = None` deletes.
     pub fn cas(
@@ -243,6 +331,10 @@ impl KvIndex {
     }
 
     /// Number of keys that currently hold a value (O(n)).
+    ///
+    /// A point-in-time convenience that holds one epoch pin for its whole
+    /// iteration, so it is unsuitable for snapshots (NFR-4); use
+    /// [`scan_versioned`](Self::scan_versioned) for those.
     pub fn len(&self) -> usize {
         let guard = epoch::pin();
         self.map
@@ -406,6 +498,187 @@ mod tests {
         assert_eq!(idx.get(b"k"), Some(Bytes::from_static(b"a")));
         assert_eq!(idx.put_at(b"k", Bytes::from_static(b"d"), 6), AtStatus::Applied);
         assert_eq!(idx.get(b"k"), Some(Bytes::from_static(b"d")));
+    }
+
+    fn b(s: &'static [u8]) -> Bytes {
+        Bytes::from_static(s)
+    }
+
+    fn scan_all(idx: &KvIndex, threshold: u64) -> Vec<VersionedEntry> {
+        let mut out = Vec::new();
+        idx.scan_versioned(threshold, |e| out.push(e));
+        out
+    }
+
+    #[test]
+    fn test_delete_at_leaves_stamped_tombstone() {
+        let idx = KvIndex::new();
+        idx.put_at(b"k", b(b"v"), 3);
+        assert_eq!(idx.delete_at(b"k", 3), AtStatus::Skipped);
+        assert_eq!(idx.get(b"k"), Some(b(b"v")));
+        assert_eq!(idx.delete_at(b"k", 4), AtStatus::Applied);
+        assert_eq!(idx.get(b"k"), None);
+        assert_eq!(idx.stamp_of(b"k"), Some(4));
+        // Re-deleting a tombstone at a higher index re-stamps it.
+        assert_eq!(idx.delete_at(b"k", 9), AtStatus::Applied);
+        assert_eq!(idx.stamp_of(b"k"), Some(9));
+        // A replayed older put cannot resurrect the key.
+        assert_eq!(idx.put_at(b"k", b(b"old"), 5), AtStatus::Skipped);
+        assert_eq!(idx.get(b"k"), None);
+    }
+
+    #[test]
+    fn test_delete_at_absent_key_creates_no_slot() {
+        let idx = KvIndex::new();
+        assert_eq!(idx.delete_at(b"ghost", 8), AtStatus::Applied);
+        assert_eq!(idx.len(), 0);
+        assert_eq!(idx.stamp_of(b"ghost"), None);
+        assert!(scan_all(&idx, 0).is_empty());
+    }
+
+    #[test]
+    fn test_cas_at_failed_does_not_stamp() {
+        let idx = KvIndex::new();
+        idx.put_at(b"k", b(b"v1"), 2);
+        assert_eq!(
+            idx.cas_at(b"k", Some(b"wrong"), Some(b(b"v2")), 6),
+            Err(CasError::Mismatch { current: Some(b(b"v1")) })
+        );
+        assert_eq!(idx.stamp_of(b"k"), Some(2));
+        assert_eq!(idx.get(b"k"), Some(b(b"v1")));
+        assert_eq!(idx.cas_at(b"k", Some(b"v1"), Some(b(b"v2")), 6), Ok(AtStatus::Applied));
+        assert_eq!(idx.stamp_of(b"k"), Some(6));
+        assert_eq!(idx.get(b"k"), Some(b(b"v2")));
+    }
+
+    #[test]
+    fn test_cas_at_skips_when_stamp_ge_index() {
+        let idx = KvIndex::new();
+        idx.put_at(b"k", b(b"v1"), 5);
+        // Skipped even though `expected` would not match: the gate runs first.
+        assert_eq!(idx.cas_at(b"k", Some(b"nope"), Some(b(b"x")), 5), Ok(AtStatus::Skipped));
+        assert_eq!(idx.cas_at(b"k", Some(b"v1"), Some(b(b"x")), 4), Ok(AtStatus::Skipped));
+        assert_eq!(idx.get(b"k"), Some(b(b"v1")));
+        assert_eq!(idx.stamp_of(b"k"), Some(5));
+    }
+
+    #[test]
+    fn test_cas_at_delete_writes_stamped_tombstone() {
+        let idx = KvIndex::new();
+        idx.put_at(b"k", b(b"v1"), 1);
+        assert_eq!(idx.cas_at(b"k", Some(b"v1"), None, 7), Ok(AtStatus::Applied));
+        assert_eq!(idx.get(b"k"), None);
+        assert_eq!(idx.stamp_of(b"k"), Some(7));
+        // Absent key, expected None, desired None: Ok, no slot created.
+        assert_eq!(idx.cas_at(b"fresh", None, None, 3), Ok(AtStatus::Applied));
+        assert_eq!(idx.stamp_of(b"fresh"), None);
+        // Insert-if-absent over the tombstone works and stamps.
+        assert_eq!(idx.cas_at(b"k", None, Some(b(b"v2")), 8), Ok(AtStatus::Applied));
+        assert_eq!(idx.stamp_of(b"k"), Some(8));
+    }
+
+    #[test]
+    fn test_scan_drops_old_tombstones_keeps_newer() {
+        let idx = KvIndex::new();
+        idx.put_at(b"live", b(b"v"), 2);
+        idx.put_at(b"dead5", b(b"v"), 1);
+        idx.delete_at(b"dead5", 5);
+        idx.put_at(b"dead6", b(b"v"), 1);
+        idx.delete_at(b"dead6", 6);
+        let got = scan_all(&idx, 5);
+        let keys: Vec<_> = got.iter().map(|e| e.key.clone()).collect();
+        assert_eq!(keys, vec![b(b"dead6"), b(b"live")]);
+        assert_eq!(got[0].value, None);
+        assert_eq!(got[0].stamp, 6);
+        assert_eq!(got[1].value, Some(b(b"v")));
+        assert_eq!(got[1].stamp, 2);
+    }
+
+    #[test]
+    fn test_scan_callback_runs_without_epoch_pin() {
+        let idx = KvIndex::new();
+        for i in 0..8u8 {
+            idx.put_at(&[i], Bytes::from(vec![i]), 1);
+        }
+        let mut seen = 0;
+        idx.scan_versioned(0, |e| {
+            assert!(!crossbeam_epoch::is_pinned(), "scan callback ran under an epoch pin");
+            // Writes during a scan are allowed.
+            idx.put_at(&e.key, Bytes::from_static(b"rewritten"), 2);
+            seen += 1;
+        });
+        assert_eq!(seen, 8);
+        assert_eq!(idx.get(&[3]), Some(b(b"rewritten")));
+    }
+
+    #[test]
+    fn test_load_versioned_roundtrips_scan() {
+        let src = KvIndex::new();
+        src.put_at(b"a", b(b"1"), 3);
+        src.put_at(b"b", b(b"2"), 4);
+        src.put_at(b"c", b(b"3"), 1);
+        src.delete_at(b"c", 9); // retained tombstone (threshold 5)
+        src.put_at(b"d", b(b"4"), 1);
+        src.delete_at(b"d", 2); // dropped tombstone
+
+        let dst = KvIndex::new();
+        let mut loaded = Vec::new();
+        src.scan_versioned(5, |e| {
+            dst.load_versioned(&e.key, e.value.clone(), e.stamp);
+            loaded.push(e.key);
+        });
+        assert_eq!(loaded, vec![b(b"a"), b(b"b"), b(b"c")]);
+        for k in [&b"a"[..], b"b", b"c"] {
+            assert_eq!(dst.get(k), src.get(k));
+            assert_eq!(dst.stamp_of(k), src.stamp_of(k));
+        }
+        assert_eq!(dst.get(b"c"), None);
+        assert_eq!(dst.stamp_of(b"c"), Some(9));
+        assert_eq!(dst.stamp_of(b"d"), None);
+        // The restored tombstone still blocks a replayed older put.
+        assert_eq!(dst.put_at(b"c", b(b"3"), 6), AtStatus::Skipped);
+    }
+
+    /// T-03-03: the (value, stamp) pair is never torn. Every value encodes
+    /// the index that wrote it, so a concurrent scan must always see them agree.
+    #[test]
+    fn test_scan_never_sees_torn_value_stamp_pair() {
+        const KEYS: u8 = 8;
+        const WRITES: u64 = 20_000;
+        let idx = Arc::new(KvIndex::new());
+        let writers: Vec<_> = (0..4u64)
+            .map(|t| {
+                let idx = Arc::clone(&idx);
+                std::thread::spawn(move || {
+                    for i in 1..=WRITES {
+                        let index = i * 4 + t;
+                        let key = [(i % KEYS as u64) as u8];
+                        let v = Bytes::copy_from_slice(&index.to_be_bytes());
+                        if index % 5 == 0 {
+                            idx.delete_at(&key, index);
+                        } else {
+                            idx.put_at(&key, v, index);
+                        }
+                    }
+                })
+            })
+            .collect();
+        let reader = {
+            let idx = Arc::clone(&idx);
+            std::thread::spawn(move || {
+                for _ in 0..200 {
+                    idx.scan_versioned(0, |e| {
+                        if let Some(v) = e.value {
+                            assert_eq!(u64::from_be_bytes(v[..8].try_into().unwrap()), e.stamp);
+                        }
+                    });
+                }
+            })
+        };
+        for w in writers {
+            w.join().unwrap();
+        }
+        reader.join().unwrap();
     }
 
     #[test]
