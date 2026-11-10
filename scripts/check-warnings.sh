@@ -6,7 +6,7 @@
 # after the dependency add; expected empty).
 set -u
 
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit 2
 
 baseline="scripts/cargo-check-baseline.txt"
 output="$(cargo check --all-targets --quiet 2>&1)"
