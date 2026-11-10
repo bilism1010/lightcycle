@@ -10,7 +10,7 @@
 //! there is no fallback to an older file because the log below the newest one has been purged.
 
 use std::fs::{self, File};
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::engine::LocalEngine;
@@ -284,7 +284,12 @@ impl SnapshotStore {
     }
 
     /// Read up to `len` bytes of `path` starting at `offset` (fewer at end of file, none past it).
+    ///
+    /// Test-only. The network client reads chunks from one already-open handle: reopening the
+    /// path per chunk would race a concurrent build that deletes the file mid-transfer.
+    #[cfg(test)]
     pub fn read_chunk(path: &Path, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+        use std::io::{Read, Seek, SeekFrom};
         let mut f = File::open(path)?;
         f.seek(SeekFrom::Start(offset))?;
         let mut out = Vec::new();
