@@ -26,7 +26,7 @@ use lightcycle::wire::hello::{client_handshake, server_handshake, Hello};
 use openraft::errors::{Fatal, RPCError, RaftError, ReplicationClosed, StreamingError};
 use openraft::network::RPCOption;
 use openraft::raft::{
-    AppendEntriesRequest, AppendResult, SnapshotResponse, VoteRequest, VoteResponse,
+    AppendEntriesRequest, AppendError, AppendResult, SnapshotResponse, VoteRequest, VoteResponse,
 };
 use openraft::type_config::alias::{LogIdOf, SnapshotMetaOf, VoteOf};
 use openraft::{BasicNode, Entry, EntryPayload, RaftNetworkFactory, RaftNetworkV2};
@@ -47,6 +47,9 @@ struct StubHandler {
     votes: AtomicUsize,
     pre_votes: AtomicUsize,
     fail_votes: AtomicBool,
+    /// The next pipelined session answers its first request with a Conflict and then ends, as
+    /// openraft's `stream_append` does after an API error.
+    conflict_next_session: AtomicBool,
     append_delay: Duration,
     append_gate: Option<Arc<Semaphore>>,
     /// Time `install_snapshot` takes after inspecting the received file.
@@ -94,6 +97,17 @@ impl RaftHandler for StubHandler {
         &self,
         reqs: BoxStream<'static, AppendEntriesRequest<TypeConfig>>,
     ) -> BoxStream<'static, Result<AppendResult<TypeConfig>, Fatal<TypeConfig>>> {
+        if self.conflict_next_session.swap(false, Ordering::SeqCst) {
+            return reqs
+                .take(1)
+                .map(|req| {
+                    Ok(Err(AppendError::Conflict {
+                        log_id: req.prev_log_id.expect("prev_log_id set"),
+                        hint: None,
+                    }))
+                })
+                .boxed();
+        }
         let delay = self.append_delay;
         let gate = self.append_gate.clone();
         reqs.then(move |req| {
@@ -440,6 +454,24 @@ fn echoed(result: AppendResult<TypeConfig>) -> u64 {
         .expect("append accepted")
         .expect("log id echoed")
         .index
+}
+
+#[tokio::test]
+async fn unary_append_after_a_conflict_redials_instead_of_failing() {
+    // After a Conflict answer the server ends the pipelined session and closes the connection;
+    // the unary client must not reuse that dead connection for the next call.
+    let stub = Arc::new(StubHandler::default());
+    stub.conflict_next_session.store(true, Ordering::SeqCst);
+    let server = start_server(stub, |_| {}).await;
+    let mut peer = client(&server, config(CLUSTER, CLIENT_NODE), Lane::Replication).await;
+
+    let first = peer.append_entries(append_req(3), opt()).await.expect("conflict is an answer");
+    assert!(matches!(first, Err(AppendError::Conflict { .. })), "got {first:?}");
+
+    let second = peer.append_entries(append_req(4), opt()).await.expect("second call succeeds");
+    assert_eq!(echoed(second), 4);
+    assert_eq!(server.stats().accepted(Lane::Replication), 2, "a deliberate redial");
+    server.shutdown().await;
 }
 
 #[tokio::test]

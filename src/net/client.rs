@@ -346,6 +346,12 @@ impl RaftNetworkV2<TypeConfig> for PeerClient {
             self.conn = None;
             network_err(e)
         })?;
+        if !matches!(wire, WireAppendResult::Accepted(_)) {
+            // The server ends its pipelined session, and with it the connection, after every
+            // Conflict or HigherVote answer. Redial on the next call on purpose instead of
+            // writing to a socket that is already closed.
+            self.conn = None;
+        }
         Ok(wire.into())
     }
 
