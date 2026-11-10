@@ -282,6 +282,33 @@ mod tests {
     }
 
     #[test]
+    fn frame_split_across_partial_reads_decodes() {
+        // Regression: after the prefix was consumed, a retry with a partial body must not
+        // re-interpret body bytes as a length prefix.
+        let mut enc = FrameCodec::new(1 << 20);
+        let frames: Vec<Frame> = (0..4u64)
+            .map(|i| Frame::new(KIND_APP_BASE, Lane::Replication, i, Bytes::from(vec![0xFFu8; 300 * (i as usize + 1)])))
+            .collect();
+        let mut wire = BytesMut::new();
+        for f in &frames {
+            enc.encode(f.clone(), &mut wire).unwrap();
+        }
+        for step in [1usize, 3, 7, 100] {
+            let mut dec = FrameCodec::new(1 << 20);
+            let mut buf = BytesMut::new();
+            let mut got = Vec::new();
+            for chunk in wire.chunks(step) {
+                buf.extend_from_slice(chunk);
+                while let Some(f) = dec.decode(&mut buf).unwrap() {
+                    got.push(f);
+                }
+            }
+            assert_eq!(got, frames, "step {step}");
+            assert!(buf.is_empty());
+        }
+    }
+
+    #[test]
     fn declared_length_over_cap_rejected_without_buffering() {
         let mut codec = FrameCodec::new(1024 * 1024);
         let mut buf = BytesMut::new();
