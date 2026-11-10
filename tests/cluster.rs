@@ -177,3 +177,49 @@ async fn single_node_snapshot_purge_restart() {
     expect_value(&node, "after", "restart").await;
     node.shutdown().await.unwrap();
 }
+
+// ---------------------------------------------------------------------------------------------
+// Three-node cluster over the fake network (plan 03-14).
+// ---------------------------------------------------------------------------------------------
+
+use common::{set_req, ClusterOpts, TestCluster};
+
+fn expect_map(prefix: &str, range: std::ops::Range<usize>) -> BTreeMap<Vec<u8>, Vec<u8>> {
+    range
+        .map(|i| (format!("{prefix}-{i:03}").into_bytes(), format!("val-{i:03}").into_bytes()))
+        .collect()
+}
+
+async fn write_keys(cluster: &TestCluster, prefix: &str, range: std::ops::Range<usize>) {
+    for i in range {
+        let resp = cluster
+            .write_via_leader(set_req(&format!("{prefix}-{i:03}"), &format!("val-{i:03}")))
+            .await
+            .expect("write acknowledged");
+        assert_eq!(resp, KvResponse::Ok);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn three_node_election_and_replication() {
+    let cluster = TestCluster::start(3, ClusterOpts::default()).await;
+    let leader = cluster.leader().await;
+    assert!((1..=3).contains(&leader));
+
+    write_keys(&cluster, "k", 0..50).await;
+    cluster.wait_converged(&[1, 2, 3], &expect_map("k", 0..50)).await;
+
+    // Replication and heartbeats travel on separate lanes: both carried traffic.
+    let stats = cluster.ctl.stats();
+    assert!(stats.replication.delivered > 0, "no replication traffic: {stats:?}");
+    assert!(stats.heartbeat.delivered > 0, "no heartbeat traffic: {stats:?}");
+
+    // All three agree on one leader and one term.
+    eventually(WAIT, "all nodes agree on leader and term", || {
+        let ms: Vec<_> = (1..=3).map(|id| cluster.node(id).metrics()).collect();
+        let ok = ms.iter().all(|m| m.current_leader == Some(leader))
+            && ms.iter().all(|m| m.current_term == ms[0].current_term);
+        async move { ok }
+    })
+    .await;
+}
