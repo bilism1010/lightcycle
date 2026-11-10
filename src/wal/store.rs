@@ -391,16 +391,22 @@ impl RaftLogStorage<TypeConfig> for WalLogStore {
                 }
                 meta.next = index + 1;
             }
+            // The writer can fail between two entries of a batch. Check before the callback moves
+            // into the final op's ack, so the error path can still complete it exactly once. (A
+            // failure in the instant between this check and the publish drops the ack, which the
+            // caller sees as the `Err` returned here; openraft treats that as fatal anyway.)
+            if let Err(e) = self.handle_mut() {
+                if let Some(cb) = callback.take() {
+                    fail_callback(cb, &e);
+                }
+                return Err(e);
+            }
             let ack: Option<Ack> = if i + 1 == count {
                 callback.take().map(|cb| -> Ack { Box::new(move |r| cb.io_completed(r)) })
             } else {
                 None
             };
-            if let Err(e) = self.submit(WalOp::Entry { index, payload: EntryBody(entry), ack }).await
-            {
-                // Only reachable before the final op was handed over; otherwise the ack owns it.
-                return Err(e);
-            }
+            self.submit(WalOp::Entry { index, payload: EntryBody(entry), ack }).await?;
         }
         Ok(())
     }
