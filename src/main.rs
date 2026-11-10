@@ -69,7 +69,7 @@ pub struct Config {
     pub cluster_id: u64,
 
     /// Designate this node to initialize a brand-new cluster (once; later starts are no-ops).
-    /// Implied when no peers are given.
+    /// Implied when no peers are given (a standalone single-node cluster; a warning is printed).
     #[arg(long)]
     pub bootstrap: bool,
 
@@ -153,6 +153,18 @@ async fn main() -> anyhow::Result<()> {
     // A standalone node (no peers) always initializes its own single-member cluster, so it goes
     // through the same code path, WAL included, as a clustered node (decision D-14).
     let bootstrap = config.bootstrap || peers.is_empty();
+    if peers.is_empty() && !config.bootstrap {
+        // An empty peer list is easy to produce by accident (a typo, a template that expanded to
+        // nothing, a node meant to join later). A fresh data directory would then start its own
+        // independent cluster, which can never be merged into the real one: say so loudly.
+        eprintln!(
+            "[Lightcycle] WARNING: no --peers given, so node {} will initialize a standalone \
+             one-node cluster if {} holds no cluster state. If this node is meant to join an \
+             existing cluster, stop now and pass --peers.",
+            config.node_id,
+            config.data_dir().display()
+        );
+    }
 
     let mut cfg = NodeConfig::new(config.node_id, config.data_dir());
     cfg.cluster_id = config.cluster_id.to_string();
@@ -203,6 +215,10 @@ async fn main() -> anyhow::Result<()> {
     };
     members.insert(config.node_id, BasicNode { addr: advertise });
     match node.bootstrap_if_needed(members).await {
+        Ok(true) if config.peers.is_empty() => println!(
+            "[Lightcycle] node {} initialized a new standalone single-node cluster",
+            config.node_id
+        ),
         Ok(true) => println!("[Lightcycle] node {} initialized a new cluster", config.node_id),
         Ok(false) => {}
         Err(e) => {
