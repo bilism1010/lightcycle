@@ -9,8 +9,10 @@
 //! length closes the connection (no resynchronization). All responses of one connection go
 //! through a single writer task so concurrent handler futures never interleave bytes.
 
+use std::fs::File;
 use std::io;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -28,10 +30,11 @@ use tokio_util::sync::CancellationToken;
 use crate::net::client::TcpNetConfig;
 use crate::net::handler::RaftHandler;
 use crate::net::protocol::{
-    decode_body, encode_body, AbortOnDrop, RemoteFailure, WireAppendResult, APPEND_REQ,
-    APPEND_RESP, PREVOTE_REQ, PREVOTE_RESP, VOTE_REQ, VOTE_RESP,
+    decode_body, decode_snap_chunk, encode_body, AbortOnDrop, RemoteFailure, SnapAck, SnapBegin,
+    WireAppendResult, APPEND_REQ, APPEND_RESP, PREVOTE_REQ, PREVOTE_RESP, SNAP_ACK, SNAP_BEGIN,
+    SNAP_CHUNK, SNAP_END, SNAP_RESP, VOTE_REQ, VOTE_RESP,
 };
-use crate::raft::types::TypeConfig;
+use crate::raft::types::{SnapshotFile, TypeConfig};
 use crate::wire::frame::{Frame, FrameCodec, FrameError, Lane, KIND_ERROR};
 use crate::wire::hello::server_handshake;
 
@@ -58,7 +61,7 @@ pub struct ServerStats {
     pub decode_errors: AtomicU64,
     /// Connections that failed the Hello (including silent ones that timed out).
     pub handshake_failures: AtomicU64,
-    /// Snapshot chunks received (written by plan 03-17).
+    /// Snapshot chunks accepted (offset and size validated, bytes written).
     pub snapshot_chunks: AtomicU64,
 }
 
@@ -199,7 +202,11 @@ async fn serve_connection(
     framed
         .codec_mut()
         .set_max_frame_length(cfg.lane_frame_cap(lane));
-    run_lane(framed, lane, cfg, handler, stats, cancel).await;
+    if lane == Lane::Snapshot {
+        run_snapshot_lane(framed, cfg, handler, stats, cancel).await;
+    } else {
+        run_lane(framed, lane, cfg, handler, stats, cancel).await;
+    }
 }
 
 /// Drain the connection's outgoing queue into the socket; cancels the connection on exit.
@@ -463,12 +470,326 @@ async fn run_lane(
                     break;
                 }
             }
-            // Unknown kind, or a kind that is not valid on this lane (snapshot frames are
-            // handled by plan 03-17): terminal.
+            // Unknown kind, or a kind that is not valid on this lane (snapshot frames only
+            // exist on the snapshot lane, see `run_snapshot_lane`): terminal.
             _ => {
                 protocol_violation(&stats, "unknown kind");
                 break;
             }
         }
     }
+}
+
+// ---- snapshot lane ---------------------------------------------------------------------------
+
+/// Time allowed for delivering a terminal error frame before the connection is dropped.
+const ERROR_SEND_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Source of receive file numbers, shared by every server in the process. Receive files are named
+/// `recv-<n>.tmp` from this counter only; no peer-supplied string ever forms part of a path.
+static NEXT_RECV: AtomicU64 = AtomicU64::new(0);
+
+/// Deletes the receive file when dropped unless the install hand-off completed, so every exit
+/// path (protocol error, close, idle timeout, task abort, handler failure) removes it.
+struct TmpGuard {
+    path: PathBuf,
+    keep: bool,
+}
+
+impl Drop for TmpGuard {
+    fn drop(&mut self) {
+        if !self.keep {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// An active snapshot receive: at most one per connection.
+struct Receive {
+    guard: TmpGuard,
+    file: Arc<File>,
+    vote: openraft::type_config::alias::VoteOf<TypeConfig>,
+    meta: openraft::type_config::alias::SnapshotMetaOf<TypeConfig>,
+    total_len: u64,
+    written: u64,
+    chunks_since_ack: usize,
+}
+
+/// Create `dir/recv-<n>.tmp` exclusively with mode 0600.
+fn create_recv_file(dir: &std::path::Path) -> io::Result<(PathBuf, File)> {
+    std::fs::create_dir_all(dir)?;
+    // A leftover file from an earlier process makes `create_new` fail; try the next number.
+    for _ in 0..1024 {
+        let n = NEXT_RECV.fetch_add(1, Ordering::Relaxed);
+        let path = dir.join(format!("recv-{n}.tmp"));
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        match opts.open(&path) {
+            Ok(file) => return Ok((path, file)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "no free receive file name",
+    ))
+}
+
+/// Write all of `buf` at `offset` without moving a shared file cursor.
+fn pwrite_all(file: &File, buf: &[u8], offset: u64) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        file.write_all_at(buf, offset)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        let mut done = 0usize;
+        while done < buf.len() {
+            let n = file.seek_write(&buf[done..], offset + done as u64)?;
+            if n == 0 {
+                return Err(io::ErrorKind::WriteZero.into());
+            }
+            done += n;
+        }
+        Ok(())
+    }
+}
+
+/// Deliver `frame` within `bound`; false when the peer cannot take it.
+async fn send_bounded(
+    framed: &mut Framed<TcpStream, FrameCodec>,
+    frame: Frame,
+    bound: Duration,
+) -> bool {
+    matches!(tokio::time::timeout(bound, framed.send(frame)).await, Ok(Ok(())))
+}
+
+/// Reject a snapshot request: count the violation and tell the peer why, best effort. The caller
+/// closes the connection.
+async fn snapshot_reject(
+    framed: &mut Framed<TcpStream, FrameCodec>,
+    stats: &ServerStats,
+    req_id: u64,
+    fatal: bool,
+    why: &str,
+) {
+    protocol_violation(stats, why);
+    let failure = RemoteFailure::new(fatal, why);
+    let _ = send_bounded(
+        framed,
+        error_frame(Lane::Snapshot, req_id, &failure),
+        ERROR_SEND_TIMEOUT,
+    )
+    .await;
+}
+
+/// Snapshot-lane state machine (decisions D-11, D-12), one connection, one active receive.
+///
+/// `SNAP_BEGIN` creates the receive file; every `SNAP_CHUNK` must continue exactly where the file
+/// ends and stay within the declared length; `SNAP_END` requires the file to be complete, then
+/// hands it to `RaftHandler::install_snapshot`. While a receive is active every wait for the next
+/// frame is bounded by `snapshot_idle_timeout`. Any violation closes the connection; there is no
+/// resynchronization.
+async fn run_snapshot_lane(
+    mut framed: Framed<TcpStream, FrameCodec>,
+    cfg: Arc<TcpNetConfig>,
+    handler: Arc<dyn RaftHandler>,
+    stats: Arc<ServerStats>,
+    cancel: CancellationToken,
+) {
+    let window = cfg.snapshot_ack_window.max(1);
+    let idle = cfg.snapshot_idle_timeout;
+    let mut recv: Option<Receive> = None;
+
+    loop {
+        let active = recv.is_some();
+        let next = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => break,
+            next = async {
+                if active {
+                    tokio::time::timeout(idle, framed.next()).await.ok()
+                } else {
+                    Some(framed.next().await)
+                }
+            } => next,
+        };
+        let frame = match next {
+            // An active receive that sent nothing for the idle bound.
+            None => {
+                tracing::debug!("snapshot sender idle; closing connection");
+                break;
+            }
+            Some(None) => break,
+            Some(Some(Err(FrameError::Io(_)))) => break,
+            Some(Some(Err(e))) => {
+                protocol_violation(&stats, &format!("frame decode: {e}"));
+                break;
+            }
+            Some(Some(Ok(frame))) => frame,
+        };
+        if frame.header.lane != Lane::Snapshot as u8 {
+            protocol_violation(&stats, "lane mismatch");
+            break;
+        }
+        let req_id = frame.header.req_id;
+        match frame.header.kind {
+            SNAP_BEGIN => {
+                if recv.is_some() {
+                    protocol_violation(&stats, "second snapshot begin");
+                    break;
+                }
+                let Ok(begin) = decode_body::<SnapBegin>(&frame.body) else {
+                    protocol_violation(&stats, "snapshot begin body");
+                    break;
+                };
+                if begin.total_len > cfg.max_snapshot_bytes {
+                    snapshot_reject(&mut framed, &stats, req_id, false, "snapshot too large")
+                        .await;
+                    break;
+                }
+                let dir = cfg.recv_dir.clone();
+                let created =
+                    tokio::task::spawn_blocking(move || create_recv_file(&dir)).await;
+                let Ok(Ok((path, file))) = created else {
+                    snapshot_reject(
+                        &mut framed,
+                        &stats,
+                        req_id,
+                        false,
+                        "cannot create snapshot receive file",
+                    )
+                    .await;
+                    break;
+                };
+                recv = Some(Receive {
+                    guard: TmpGuard { path, keep: false },
+                    file: Arc::new(file),
+                    vote: begin.vote,
+                    meta: begin.meta,
+                    total_len: begin.total_len,
+                    written: 0,
+                    chunks_since_ack: 0,
+                });
+            }
+            SNAP_CHUNK => {
+                let Some(r) = recv.as_mut() else {
+                    protocol_violation(&stats, "snapshot chunk without begin");
+                    break;
+                };
+                let Ok((offset, bytes)) = decode_snap_chunk(&frame.body) else {
+                    protocol_violation(&stats, "snapshot chunk body");
+                    break;
+                };
+                let end = offset.checked_add(bytes.len() as u64);
+                let within = end.is_some_and(|end| end <= r.total_len);
+                if offset != r.written || bytes.is_empty() || !within {
+                    snapshot_reject(&mut framed, &stats, req_id, false, "bad snapshot chunk")
+                        .await;
+                    break;
+                }
+                let file = r.file.clone();
+                let write =
+                    tokio::task::spawn_blocking(move || pwrite_all(&file, &bytes, offset)).await;
+                if !matches!(write, Ok(Ok(()))) {
+                    snapshot_reject(
+                        &mut framed,
+                        &stats,
+                        req_id,
+                        false,
+                        "snapshot write failed",
+                    )
+                    .await;
+                    break;
+                }
+                r.written = end.expect("checked above");
+                r.chunks_since_ack += 1;
+                count(&stats.snapshot_chunks);
+                if r.chunks_since_ack >= window {
+                    r.chunks_since_ack = 0;
+                    let Ok(body) = encode_body(&SnapAck { written: r.written }) else {
+                        break;
+                    };
+                    let ack = Frame::new(SNAP_ACK, Lane::Snapshot, req_id, body);
+                    if !send_bounded(&mut framed, ack, idle).await {
+                        break;
+                    }
+                }
+            }
+            SNAP_END => {
+                let Some(r) = recv.take() else {
+                    protocol_violation(&stats, "snapshot end without begin");
+                    break;
+                };
+                if r.written != r.total_len {
+                    snapshot_reject(&mut framed, &stats, req_id, false, "incomplete snapshot")
+                        .await;
+                    break;
+                }
+                let file = r.file.clone();
+                let synced = tokio::task::spawn_blocking(move || file.sync_all()).await;
+                if !matches!(synced, Ok(Ok(()))) {
+                    snapshot_reject(&mut framed, &stats, req_id, false, "snapshot sync failed")
+                        .await;
+                    break;
+                }
+                let Receive {
+                    mut guard,
+                    vote,
+                    meta,
+                    total_len,
+                    ..
+                } = r;
+                let installed = handler.install_snapshot(
+                    vote,
+                    meta,
+                    SnapshotFile {
+                        path: guard.path.clone(),
+                        len: total_len,
+                    },
+                );
+                let result = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => break,
+                    result = installed => result,
+                };
+                match result {
+                    Ok(resp) => {
+                        // The handler owns the file now.
+                        guard.keep = true;
+                        let Ok(body) = encode_body(&resp) else { break };
+                        let reply = Frame::new(SNAP_RESP, Lane::Snapshot, req_id, body);
+                        if !send_bounded(&mut framed, reply, idle).await {
+                            break;
+                        }
+                    }
+                    Err(fatal) => {
+                        // `guard` drops here and removes the file.
+                        drop(guard);
+                        let failure = RemoteFailure::new(true, fatal.to_string());
+                        let _ = send_bounded(
+                            &mut framed,
+                            error_frame(Lane::Snapshot, req_id, &failure),
+                            ERROR_SEND_TIMEOUT,
+                        )
+                        .await;
+                        break;
+                    }
+                }
+            }
+            _ => {
+                protocol_violation(&stats, "unknown kind");
+                break;
+            }
+        }
+    }
+    // `recv`, if still set, drops here and removes its file.
 }
