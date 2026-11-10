@@ -14,14 +14,27 @@ crossbeam = "0.8"
 crossbeam-epoch = "0.9"
 crossbeam-skiplist = "0.1"
 parking_lot = "0.12"
-bytes = "1.7"
+bytes = { version = "1.7", features = ["serde"] }
 serde = { version = "1.0", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1.0"
+openraft = { version = "=0.10.0-alpha.38", default-features = false, features = ["tokio-rt", "serde"] }
+crc32c = "0.6"
+postcard = { version = "1.1", features = ["use-std"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+futures = "0.3"
+arc-swap = "1.9"
+thiserror = "2"
 
 [dev-dependencies]
 criterion = "0.5"
+tempfile = "3"
+proptest = "1.12"
+lightcycle = { path = ".", features = ["test-util"] }
+
+[features]
+test-util = []
 
 [[bench]]
 name = "local_engine"
