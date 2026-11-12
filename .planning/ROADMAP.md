@@ -32,6 +32,7 @@ Phase 1: Architecture Spikes & Deep Research ──► Phase 2: Lock-Free Core &
 - [ ] Milestone 4.1: Bridge Raft committed entries to lock-free memory arena.
 - [ ] Milestone 4.2: Implement Read-Index / Leader Lease read paths to bypass quorum consensus for reads.
 - [ ] Milestone 4.3: Linearizable validation and Jepsen-style fault injection tests.
+- [ ] Milestone 4.4: FR-2 remainder - `WATCH` / multi-key conditional updates. Single-key `CAS` shipped in Phases 2-3; multi-key operations need a consistent-cut snapshot, which reopens the fuzzy-snapshot design (D-09, assumption A12). Added 2026-11-10 from Phase 3 UAT.
 
 ## Phase 5: Wire Protocols & Client API
 - [ ] Milestone 5.1: Redis RESP protocol parser & command executor (`GET`, `SET`, `MGET`, `DEL`, `CAS`).

@@ -25,6 +25,7 @@ Out of scope here (other phases): bridging committed entries into the arena and 
 - **D-05:** Raft RPCs (AppendEntries, Vote, InstallSnapshot) use a custom length-prefixed binary protocol over Tokio TCP, zero-copy friendly with `Bytes`. Not gRPC/tonic, not QUIC. — **Reversibility:** costly — wire format becomes a cluster-compat contract once nodes interoperate.
 - **D-06:** Separate listener/port from Phase 5's client RPC; the length-prefixed frame codec is written once as a shared module/crate and reused by Phase 5.
 - **D-07:** One persistent connection per peer with pipelined AppendEntries (multiple in flight per follower), per the roadmap's "pipelined Raft".
+  - **Amendment (2026-11-10, accepted by the user in Phase 3 UAT, interpretation A4):** "one persistent connection" means one persistent pipelined *replication* connection per peer. Heartbeats and snapshot transfers each use their own dedicated, lazily dialed connection (D-12), so a peer pair has up to three TCP connections. Chosen so a bulk lane cannot head-of-line block heartbeats; a single multiplexed connection is not required.
 - **D-08:** No TLS/auth in this phase (plaintext on trusted network). TLS/mTLS is a deferred idea.
 
 ### Snapshot format & trigger
