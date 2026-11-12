@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { ThemeProvider, WidgetContainer, useTheme } from 'lumagrid';
 import type { ThemeDefinition, TransformedData } from 'lumagrid';
@@ -66,7 +66,7 @@ function useWidth(): number {
 
 function Tile({ label, value, unit, note, color }: { label: string; value: string; unit: string; note: string; color: string }) {
   return (
-    <div style={{ background: 'linear-gradient(160deg,#0f1a2e,#0b1220)', border: '1px solid #1e3a5f', borderRadius: 14, padding: '18px 20px', boxShadow: `0 0 28px ${color}1f` }}>
+    <div style={{ minWidth: 0, background: 'linear-gradient(160deg,#0f1a2e,#0b1220)', border: '1px solid #1e3a5f', borderRadius: 14, padding: '18px 20px', boxShadow: `0 0 28px ${color}1f` }}>
       <div style={{ color: '#7f95b5', fontSize: 12, letterSpacing: '.12em', textTransform: 'uppercase' }}>{label}</div>
       <div style={{ marginTop: 8, color, fontSize: 40, fontWeight: 700, lineHeight: 1, textShadow: `0 0 18px ${color}66` }}>
         {value}<span style={{ fontSize: 16, fontWeight: 500, marginLeft: 6, color: '#a9bbd6' }}>{unit}</span>
@@ -78,7 +78,7 @@ function Tile({ label, value, unit, note, color }: { label: string; value: strin
 
 function Card({ title, sub, children }: { title: string; sub: string; children: React.ReactNode }) {
   return (
-    <section style={{ background: '#0b1220', border: '1px solid #1e3a5f', borderRadius: 16, padding: '18px 18px 14px', boxShadow: '0 10px 40px rgba(34,229,255,.06)' }}>
+    <section style={{ minWidth: 0, overflow: 'hidden', background: '#0b1220', border: '1px solid #1e3a5f', borderRadius: 16, padding: '18px 18px 14px', boxShadow: '0 10px 40px rgba(34,229,255,.06)' }}>
       <h2 style={{ margin: 0, fontSize: 17, color: '#e8f4ff', fontWeight: 650 }}>{title}</h2>
       <p style={{ margin: '4px 0 10px', fontSize: 12.5, color: '#7f95b5' }}>{sub}</p>
       {children}
@@ -86,12 +86,33 @@ function Card({ title, sub, children }: { title: string; sub: string; children: 
   );
 }
 
+/**
+ * The chart's width comes from a wrapper this page controls, and the chart is absolutely positioned inside it,
+ * so nothing the chart renders can change the wrapper's size. (Letting the container measure itself with
+ * width: '100%' inside a grid creates a feedback loop: a box slightly wider than its cell widens the cell.)
+ */
 function Column({ data, label, value, color, h = 300, title }: { data: TransformedData; label: string; value: string; color?: string; h?: number; title: string }) {
   const theme = useTheme();
+  const ref = useRef<HTMLDivElement>(null);
+  const [w, setW] = useState(0);
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const ro = new ResizeObserver(() => setW(Math.floor(el.getBoundingClientRect().width)));
+    ro.observe(el);
+    setW(Math.floor(el.getBoundingClientRect().width));
+    return () => ro.disconnect();
+  }, []);
   return (
-    <WidgetContainer data={data} width="100%" height={h}>
-      {(d, w, hh) => <ColumnChart theme={theme} data={d} width={w} height={hh} labelField={label} valueField={value} colorField={color} showValues ariaLabel={title} />}
-    </WidgetContainer>
+    <div ref={ref} style={{ position: 'relative', width: '100%', minWidth: 0, height: h, overflow: 'hidden' }}>
+      {w > 0 && (
+        <div style={{ position: 'absolute', inset: 0 }}>
+          <WidgetContainer data={data} width={w} height={h}>
+            {(d, cw, ch) => <ColumnChart theme={theme} data={d} width={cw} height={ch} labelField={label} valueField={value} colorField={color} showValues ariaLabel={title} />}
+          </WidgetContainer>
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -110,14 +131,14 @@ function App() {
             It does not validate NFR-1 or NFR-2.
           </p>
 
-          <div style={{ display: 'grid', gridTemplateColumns: `repeat(${w > 760 ? 4 : 2}, 1fr)`, gap: 14, margin: '26px 0' }}>
+          <div style={{ display: 'grid', gridTemplateColumns: `repeat(${w > 760 ? 4 : 2}, minmax(0, 1fr))`, gap: 14, margin: '26px 0' }}>
             <Tile label="fsync p50" value="512" unit="µs" note="64 in flight, 101 fsyncs. Log is bucketed to powers of two." color="#22e5ff" />
             <Tile label="Records per fsync" value="49.5" unit="×" note="Group commit: 5,001 records acknowledged by 101 fsyncs." color="#b6ff3b" />
             <Tile label="Commit p99 (serial)" value="546" unit="µs" note="One record at a time, fsync every record (n = 297)." color="#ff3fa4" />
             <Tile label="GET p99 · 8 threads" value="542" unit="ns" note="Limit 667 ns. Regression guard passed (macOS dev host)." color="#ffb02e" />
           </div>
 
-          <div style={{ display: 'grid', gridTemplateColumns: `repeat(${cols}, 1fr)`, gap: 18 }}>
+          <div style={{ display: 'grid', gridTemplateColumns: `repeat(${cols}, minmax(0, 1fr))`, gap: 18 }}>
             <Card title="Commit latency" sub="Time from append to acknowledgement, µs. Fsync on every batch (StdFsIo).">
               <Column title="Commit latency percentiles" data={table(commitLatency, [['pct', 'string'], ['series', 'string'], ['us', 'number']])} label="pct" value="us" color="series" />
               <p style={{ margin: '8px 0 0', fontSize: 12, color: '#7f95b5' }}>64 in flight (group commit) also had p99.9 = 36,047 µs (n = 4,950). The serial run has too few samples (297) for a p99.9.</p>
