@@ -1,8 +1,8 @@
 ---
 phase: 03-consensus-persistence-engine
-verified: 2026-11-10T12:00:00Z
-status: human_needed
-score: 6/7 must-haves verified
+verified: 2026-11-12T04:30:00Z
+status: passed
+score: 7/7 must-haves verified
 covered_files:
   - ".planning/phases/03-consensus-persistence-engine/03-01-PLAN.md"
   - ".planning/phases/03-consensus-persistence-engine/03-01-SUMMARY.md"
@@ -89,183 +89,144 @@ covered_files:
   - "tests/tcp_smoke.rs"
   - "tests/transport.rs"
   - "tests/wal_test_util_reachable.rs"
-covered_digest: "v4:sha256:bd421500a409f29cb1f27e44de15f8e09c3b23030e388b3c580b86afe651e6ed"
+covered_digest: "v4:sha256:fc6a2279556222ab85fb412df4dd411c11fadf2a9bf20200f89eeb4ec2efc9a4"
 behavior_unverified: 0
 overrides_applied: 0
-re_verification: none
+re_verification:
+  previous_status: human_needed
+  previous_score: 6/7
+  gaps_closed:
+    - "D-07 connection model: user accepted interpretation A4, recorded as an amendment in 03-CONTEXT.md (truth 7 now VERIFIED under the amendment)"
+  gaps_remaining: []
+  regressions: []
 gaps: []
 deferred:
   - truth: "NFR-1 (P99 read < 150us, P99 write < 2ms on 3 nodes) and NFR-2 (>= 500k ops/s) on real hardware"
     addressed_in: "Phase 6"
-    evidence: "ROADMAP Phase 6 milestones 6.1 (high-load benchmark harness) and 6.2 (P99/P99.9 tail-latency profiling); 03-VALIDATION.md Manual-Only row says the replicated-write P99 claim needs an end-to-end measurement in Phase 6 on a Linux NVMe host. Not claimed by Phase 3 (absent from every plan's requirements frontmatter)."
-human_verification:
-  - test: "Decide whether up to three TCP connections per peer (replication, heartbeat, snapshot lanes) is acceptable against decision D-07 (one persistent connection per peer)"
-    expected: "Either accept interpretation A4 (one persistent pipelined replication connection plus dedicated heartbeat and snapshot connections), recording it as a CONTEXT.md amendment, or require a single multiplexed connection (priority writer, head-of-line risk), which means rework of src/net/client.rs, src/net/server.rs and the lane tests"
-    why_human: "D-07 is a locked user decision and D-05 marks the wire format as costly to reverse. Interpretation A4 was written into 03-RESEARCH.md as an assumption and never marked RESOLVED by the user (only A1, the openraft alpha, was confirmed). The code does what A4 says; only the user can say whether it satisfies D-07."
-  - test: "Decide the status of FR-2 (atomic CAS plus WATCH/multi-key conditional updates)"
-    expected: "Either accept FR-2 as split (single-key CAS done in Phases 2-3, WATCH/multi-key explicitly unscheduled) and add a roadmap item for it, or require it before Phase 3 closes. Plans 03-02 and 03-05 record requirements-completed: FR-2, which overstates this."
-    why_human: "Scope and traceability decision. Multi-key conditionals (assumption A12) need a consistent-cut snapshot design; no ROADMAP milestone in Phases 3-6 schedules them (Phase 5 only lists a CAS command)."
-  - test: "Decide whether the binary should warn on, or refuse, non-private --bind addresses"
-    expected: "Either accept README-only guidance, or add a warning / refusal for 0.0.0.0 and non-loopback binds. Note the functional hazard below."
-    why_human: "Security-posture decision for a plaintext, unauthenticated port (D-08). Observed in src/main.rs: any --bind is accepted silently, and the bootstrap membership advertises the listener's local_addr, so --bind 0.0.0.0:PORT would publish the unroutable address 0.0.0.0:PORT as this node's membership address."
-  - test: "Run cargo bench --bench wal and an end-to-end 3-node write benchmark on a Linux NVMe host"
-    expected: "WAL fsync percentiles on NVMe, and P99 write < 2ms (3 nodes), >= 500k ops/s, as NFR-1 and NFR-2 require"
-    why_human: "Needs hardware the dev host (macOS, F_FULLFSYNC p50 about 4ms) does not have. 03-VALIDATION.md keeps this row open; it is not a Phase 3 claim and is carried to Phase 6."
+    evidence: "ROADMAP Phase 6 milestones 6.1 and 6.2; 03-UAT.md test 4 skipped by the user (will run on Linux NVMe); not claimed by any Phase 3 plan"
+  - truth: "FR-2 remainder: WATCH / multi-key conditional updates"
+    addressed_in: "Phase 4 Milestone 4.4"
+    evidence: "ROADMAP.md Milestone 4.4 'FR-2 remainder - WATCH / multi-key conditional updates'; REQUIREMENTS.md FR-2 status note; accepted by the user in 03-UAT.md test 2"
 ---
 
 # Phase 3: Consensus & Persistence Engine Verification Report
 
-**Phase Goal (derived):** ROADMAP.md carries no explicit Goal line or success-criteria list for Phase 3, so the goal was derived from the four roadmap milestones plus 03-CONTEXT.md (Phase Boundary and decisions D-01 to D-16): "Deliver the distributed tier's durability and replication core: a Raft consensus node (openraft) with a segmented, group-committed on-disk WAL, a custom Tokio TCP peer transport, a snapshot/restore engine over the Phase 2 LocalEngine, and static-bootstrap plus dynamic membership." Must-haves were then taken from the milestones, the 17 PLAN `must_haves` blocks and the locked decisions.
-**Verified:** 2026-11-10
-**Status:** human_needed
-**Re-verification:** No, initial verification
+**Phase Goal (derived):** ROADMAP.md carries no explicit Goal line or success-criteria list for Phase 3, so the goal is derived from the four roadmap milestones (3.1 Raft state machine and log store, 3.2 group-committed WAL, 3.3 membership and heartbeat network layer, 3.4 snapshotting and state transfer) plus 03-CONTEXT.md decisions D-01 to D-16: "Deliver the distributed tier's durability and replication core: a Raft consensus node (openraft) with a segmented, group-committed on-disk WAL, a custom Tokio TCP peer transport, a snapshot/restore engine over the Phase 2 LocalEngine, and static-bootstrap plus dynamic membership."
+**Verified:** 2026-11-12
+**Status:** passed
+**Re-verification:** Yes, after two code-review fix passes (about 55 fix commits, 8c871c6..44e41c5) and the user's UAT rulings (commits b3de4e1, 6bbf8e4)
 
 ## Goal Achievement
 
-The engineering goal is met in the codebase. Nothing is a stub or unwired, and every automated check I ran is green. Status is `human_needed` rather than `passed` because one locked decision (D-07) is implemented under an unconfirmed interpretation, and two scope/safety questions (FR-2 overclaim, `--bind`) need a user ruling. No gaps (BLOCKERs) were found.
+The goal is achieved in the current tree. Every must-have from the previous report was re-checked against the post-fix code and none regressed. The one previously uncertain truth (D-07) is resolved by the user's amendment. The suite and gates were re-run from scratch by this verifier (results below). The only remaining open items are the four the user has already ruled on, plus the documented review partials, none of which breaks a must-have.
 
 ### Observable Truths
 
 | # | Truth | Status | Evidence |
 |---|-------|--------|----------|
-| 1 | Milestone 3.1: a Raft state machine and log-store abstraction exist on openraft, applying stamped SET/DEL/CAS into LocalEngine | VERIFIED | `Cargo.toml` pins `openraft = "=0.10.0-alpha.38"`; `src/raft/state_machine.rs` (985 lines) implements `RaftStateMachine` with `ApplySink` seam (R-3); `src/wal/store.rs` implements the log storage traits; `raft::state_machine` 22/22 tests pass, including `cas_counterexample`, `fuzzy_replay_model` (proptest) and `naive_replay_diverges_*` (negative controls) which resolve R-1 |
-| 2 | Milestone 3.2: segmented, CRC32C WAL on `std::fs` behind a trait, group commit on a dedicated thread draining the Phase 2 ring, ack only after fsync, no timer batching, torn tail discarded on recovery (D-01..D-04, D-16) | VERIFIED | `src/wal/writer.rs` (1537 lines) uses `Consumer::consume_batch` over `RingBuffer`, `SegmentIo` seam with `StdFsIo`/`FakeIo`, fsync errors are fail-stop; `wal::writer` 20/20 and `wal::recovery` 22/22 pass (power-loss ordering, torn tail at every offset, bad CRC in non-last segment is a hard error); default `--fsync always`, `periodic`/`never` warn UNSAFE (D-04). Performance on NVMe is NOT verified (see NFR-1/2 deferral) |
-| 3 | Milestone 3.3: static bootstrap, dynamic add/remove via joint consensus, heartbeat and replication transport over TCP with a shared codec | VERIFIED (D-07 caveat in truth 7) | `src/net/client.rs`, `src/net/server.rs`, `src/wire/{frame,hello}.rs`; wire has no `openraft` import; `tests/cluster.rs` has `membership_add_voter`, `membership_remove_voter`, `membership_replace_voters_joint`, `membership_remove_leader_new_leader_elected` (assertions inspect real membership state and `saw_joint`); `tests/tcp_smoke.rs` elects and replicates over real localhost TCP; `pipelined_in_order` passes (real pipelined `stream_append`, request and byte windows) |
-| 4 | Milestone 3.4: epoch-pinned fuzzy snapshot, framed CRC file via the shared codec, trigger every N applied entries with log purge, chunked transfer on its own connection with backpressure that cannot starve heartbeats (D-09..D-12) | VERIFIED | `src/snapshot/{format,writer,store,reader}.rs` use `FrameCodec`; `scan_versioned` in `src/storage/index.rs` pins per entry, never across the scan; `SnapshotPolicy` trigger in `src/raft/config.rs`; `tcp_snapshot_lane_install` and `kill_restart_snapshot_catchup` pass; `snapshot_does_not_starve_heartbeat` (32 MiB in flight) passes; release `snapshot::concurrent_scan::concurrent_scan_restore_replay_equals_live` passes (re-run by me) |
-| 5 | Crash-recovery bar (D-16, FR-6): kill-and-restart loses no committed write; torn final WAL record is detected and discarded; non-vacuous | VERIFIED | `tests/cluster.rs kill_restart_keeps_committed_writes` asserts `torn_bytes_discarded > 0` and identical engines; `single_node_restart`, `single_node_snapshot_purge_restart`; orchestrator baseline 13/13 cluster tests green |
-| 6 | Phase 2 is not regressed by the stamped-cell change (NFR-3, NFR-4) | VERIFIED | `bash scripts/check-get-regression.sh` re-run: GET p99 250ns at 1 thread (limit 334), 500ns at 8 threads (limit 667); Phase 2 tests (storage, engine, ipc, arena) green in baseline; tombstone rule (R-2) covered by `tombstone_*` tests |
-| 7 | D-07: "One persistent connection per peer with pipelined AppendEntries" | UNCERTAIN (needs user decision) | `new_client`, `new_heartbeat_client` and `new_snapshot_client` in `src/net/client.rs:136-146` each dial their own TCP connection tagged by `Lane` in the Hello; README line 135 states "up to three TCP connections" per peer. Pipelining itself is real. The deviation is by design (assumption A4 in 03-RESEARCH.md, justified by D-12), but A4 was never confirmed by the user |
+| 1 | Milestone 3.1: a Raft state machine and log-store abstraction exist on openraft, applying stamped SET/DEL/CAS into LocalEngine | VERIFIED | `Cargo.toml:22` pins `openraft = "=0.10.0-alpha.38"` (default-features off, `tokio-rt`, `serde`); `src/raft/state_machine.rs` implements `RaftStateMachine` behind the `ApplySink` seam; `src/wal/store.rs` implements the log storage traits. Re-run: `cas_counterexample`, `fuzzy_replay_model`, `naive_replay_diverges_on_counterexample`, `naive_replay_diverges_in_generated_helper`, `tombstone_*` all ok. Post-fix change in `state_machine.rs` (build lock serializing `install_snapshot` against an in-flight build; `body_corruption` mapping) is covered by `install_waits_for_an_in_flight_build` and `open_reports_wipe_guidance_for_a_corrupt_snapshot_body`, both ok |
+| 2 | Milestone 3.2: segmented CRC32C WAL on `std::fs` behind a trait, group commit on a dedicated thread draining the Phase 2 ring, ack only after fsync, no timer batching, torn tail discarded on recovery (D-01..D-04, D-16) | VERIFIED | `src/wal/writer.rs:295` still drains via `Consumer::consume_batch`. Post-fix writer changes re-read: `run_purge` still does `write_run`, `sync_active` (marker durable) before any `delete_segment`, then one `sync_dir`; the new `on_purge` observer call sits after the durable marker and before the unlinks (`purge_is_reported_to_the_observer_before_segments_are_deleted` ok). An unacked record that does not fit now fail-stops instead of leaving a durable index gap (`unacked_oversize_record_fail_stops_instead_of_leaving_a_gap` ok). Durability-ordering tests still pass: `tracer_acked_entry_survives_power_loss`, `rolled_segment_acked_entry_survives_power_loss`, `crash_between_purge_marker_and_deletions_keeps_marker_durable`, `fake_io_created_segment_lost_on_power_loss_without_sync_dir`. Recovery: `torn_tail_every_byte_offset`, `data_after_end_marker_in_non_last_segment_is_corrupt`, `entry_index_gap_is_corrupt`, `recovery_stats_report_torn_bytes` ok. The IN-03 change (tolerate a purge-straggler gap) did not weaken the hard error: `lost_middle_segment_is_still_a_gap_error_and_nothing_is_deleted` ok |
+| 3 | Milestone 3.3: static bootstrap, dynamic add/remove via joint consensus, heartbeat and replication transport over TCP with a shared codec | VERIFIED | `src/net/{client,server,handler,fake,protocol}.rs`, `src/wire/{frame,hello}.rs`; no `openraft` reference under `src/wire` (grep empty). `tests/cluster.rs`: `membership_add_voter`, `membership_remove_voter`, `membership_replace_voters_joint`, `membership_remove_leader_new_leader_elected`, `three_node_election_and_replication`, `leader_failover_new_leader_elected`, `partition_heals_and_minority_converges` ok; `tests/tcp_smoke.rs` `three_nodes_over_tcp_elect_and_replicate` ok; `tests/transport.rs` `pipelined_in_order` ok. `src/main.rs` wires `TcpNetConfig::validate`, `RaftNode::start`, `PeerServer::bind` and `bootstrap_if_needed` |
+| 4 | Milestone 3.4: epoch-pinned fuzzy snapshot, framed CRC file via the shared codec, trigger every N applied entries with purge, chunked transfer on its own connection with backpressure that cannot starve heartbeats (D-09..D-12) | VERIFIED | `src/snapshot/{format,writer,store,reader}.rs`; `tcp_snapshot_lane_install`, `kill_restart_snapshot_catchup`, `single_node_snapshot_purge_restart`, `snapshot_does_not_starve_heartbeat` (reworked by IN-26 to 64 KiB chunks and 2 ms heartbeat spacing) ok. Release-mode `snapshot::concurrent_scan::concurrent_scan_restore_replay_equals_live` re-run by this verifier: ok. New WR-04 path (`validate_snapshot` before `install_snapshot`, a corrupt received snapshot no longer fatal to the receiver) is covered by a tcp_smoke test, ok |
+| 5 | Crash-recovery bar (D-16, FR-6): kill-and-restart loses no committed write; torn final WAL record detected and discarded; non-vacuous | VERIFIED | `kill_restart_keeps_committed_writes`, `single_node_restart`, `single_node_snapshot_purge_restart` ok; the review fixes WR-16/WR-17 hardened the previously vacuous torn-tail and uncommitted-write assertions rather than weakening them |
+| 6 | Phase 2 is not regressed by the stamped-cell change (NFR-3, NFR-4) | VERIFIED | `bash scripts/check-get-regression.sh` re-run: GET p99 250 ns at 1 thread (limit 334), 542 ns at 8 threads (limit 667), PASS on attempt 1. Phase 2 storage/engine/ipc/arena tests are part of the 252 passing lib tests. `test_scan_never_sees_torn_value_stamp_pair`, `test_scan_drops_old_tombstones_keeps_newer`, `test_delete_at_leaves_stamped_tombstone` ok |
+| 7 | D-07: one persistent pipelined connection per peer for replication | VERIFIED (under the user-accepted amendment) | `new_client`, `new_heartbeat_client`, `new_snapshot_client` at `src/net/client.rs:214/218/222` dial lane-tagged connections. 03-CONTEXT.md D-07 now carries the amendment (A4, accepted 2026-11-10): one pipelined replication connection plus dedicated lazily dialed heartbeat and snapshot connections, up to three per peer. Pipelining is real (`pipelined_in_order`). 03-UAT.md test 1: pass |
 
-**Score:** 6/7 truths verified (1 uncertain, 0 failed, 0 behavior-unverified)
+**Score:** 7/7 truths verified (0 failed, 0 behavior-unverified)
 
 ### Deferred Items
 
 | # | Item | Addressed In | Evidence |
 |---|------|-------------|----------|
-| 1 | NFR-1 and NFR-2 hardware validation (P99 < 2ms writes on 3 nodes, 500k ops/s) | Phase 6 | ROADMAP milestones 6.1, 6.2; 03-VALIDATION.md Manual-Only row; absent from all plan `requirements` frontmatter; README says "no latency claim is made yet" |
+| 1 | NFR-1 and NFR-2 hardware validation (P99 < 2 ms writes on 3 nodes, 500k ops/s) | Phase 6 (milestones 6.1, 6.2) | User skipped UAT test 4 with reason (will run on Linux NVMe); not in any Phase 3 plan `requirements` |
+| 2 | FR-2 remainder: WATCH / multi-key conditional updates | Roadmap Milestone 4.4 | Added 2026-11-10 from UAT test 2; REQUIREMENTS.md FR-2 carries a status note |
 
 ### Required Artifacts
 
-All artifacts named in the 17 plans' `must_haves.artifacts` exist, are substantive (no `TODO`/`FIXME`/`XXX`/`todo!`/`unimplemented!` in `src/`; the only `unimplemented!` hits are in `tests/openraft_api_gate.rs`, which is a deliberate compile-time skeleton, not production code) and are wired into `RaftNode::start` and `src/main.rs`.
-
 | Artifact | Status | Details |
 |----------|--------|---------|
-| `src/wal/{record,io,segment,writer,recovery,cache,store}.rs` | VERIFIED | 243 to 1537 lines each, driven by `WalLogStore` in `RaftNode::start_with_io`; `StdFsIo` used in production start |
-| `src/wire/{frame,hello}.rs` | VERIFIED | Used by net, snapshot format and (Phase 5 reuse) |
-| `src/net/{handler,fake,protocol,client,server}.rs` | VERIFIED | `PeerServer::bind` and `TcpNetworkFactory` wired in `src/main.rs` |
-| `src/raft/{types,config,state_machine,node}.rs` | VERIFIED | `RaftNode::engine()` reloads the shared `ArcSwap` handle on each call |
+| `src/wal/{record,io,segment,writer,recovery,cache,store}.rs` | VERIFIED | Present, substantive, driven by `WalLogStore` in `RaftNode::start`; `StdFsIo` in production |
+| `src/wire/{frame,hello}.rs` | VERIFIED | Hello now also rejects self-dial (IN-10) and reports lane mismatch (IN-23); unit tests ok |
+| `src/net/{handler,fake,protocol,client,server}.rs` | VERIFIED | `PeerServer` and `TcpNetworkFactory` wired in `src/main.rs`; connection caps, idle/keepalive/write timeouts (WR-10/11) tested |
+| `src/raft/{types,config,state_machine,node}.rs` | VERIFIED | `RaftNode::engine()` is `self.engine_handle.load_full()` (`node.rs:163`), not captured at start; `engine_accessor_is_not_captured_at_start` and `engine_handle_tracks_install_snapshot` ok. `start` now validates config before touching disk (IN-09) and rejects over-limit commands up front (CR-02, `oversized_write_is_rejected_without_stopping_the_node` ok) |
 | `src/snapshot/{format,writer,store,reader}.rs` | VERIFIED | Used by `KvStateMachine` build and install |
-| `src/storage/index.rs`, `src/engine.rs` | VERIFIED | `put_at`/`delete_at`/`cas_at`/`scan_versioned`/`load_versioned` present and used by `InlineSink` |
-| `scripts/check-warnings.sh`, `scripts/cargo-check-baseline.txt`, `scripts/check-get-regression.sh` | VERIFIED | Baseline file is empty (0 bytes), GET guard re-run passes |
-| `benches/wal.rs`, `tests/{cluster,tcp_smoke,transport,cli_smoke,openraft_api_gate,wal_test_util_reachable}.rs`, `tests/common/mod.rs` | VERIFIED | Present; no `#[ignore]` anywhere |
+| `src/storage/index.rs`, `src/engine.rs` | VERIFIED | `put_at`/`delete_at`/`cas_at`/`scan_versioned` present and exercised |
+| `scripts/check-warnings.sh`, `scripts/cargo-check-baseline.txt`, `scripts/check-get-regression.sh` | VERIFIED | `check-warnings.sh` exit 0 (baseline file empty, 0 bytes); GET guard passes |
+| `benches/{wal,local_engine}.rs`, `tests/*.rs`, `tests/common/mod.rs` | VERIFIED | No `#[ignore]` anywhere in src/tests/benches |
 
 ### Key Link Verification
 
 | From | To | Via | Status |
 |------|----|-----|--------|
 | `InlineSink` | `LocalEngine::{set_at,delete_at,cas_at}` | log index as stamp | WIRED |
-| WAL writer thread | `ipc::ring_buffer::Consumer::consume_batch` | drains ring, one fsync per batch | WIRED |
-| `SharedObserver` | `WalObserver` callbacks | ordered `on_flushed`, `on_truncate`, `on_purge` | WIRED |
-| `PeerServer` | `RaftHandler` (`Arc<dyn RaftHandler>`) | per-lane dispatch | WIRED |
-| `PeerClient` | `wire::hello::client_handshake` | lane-tagged Hello on every connection | WIRED |
-| `RaftNode::engine_handle` | `KvStateMachine::install_snapshot` | the same `Arc<ArcSwap<LocalEngine>>`; `engine_handle_tracks_install_snapshot` and `engine_accessor_is_not_captured_at_start` pass | WIRED |
-| `main.rs` | `RaftNode::start`, `PeerServer::bind`, `bootstrap_if_needed` | CLI flags to `NodeConfig` | WIRED |
+| WAL writer thread | `Consumer::consume_batch` | one fsync per drained batch | WIRED |
+| WAL writer | `WalObserver` | ordered `on_flushed`, `on_truncate`, `on_purge` (purge reported after durable marker, before unlink) | WIRED |
+| `PeerServer` | `RaftHandler` | per-lane dispatch, `validate_snapshot` before install | WIRED |
+| `PeerClient` | `wire::hello` handshake | lane-tagged Hello on every connection | WIRED |
+| `RaftNode::engine_handle` | `KvStateMachine::install_snapshot` | same `Arc<ArcSwap<LocalEngine>>` | WIRED |
+| `main.rs` | `RaftNode::start`, `PeerServer::bind`, `bootstrap_if_needed` | CLI flags to `NodeConfig`, `--advertise` published address | WIRED |
 
 ### Data-Flow Trace (Level 4)
 
-Client write goes `RaftNode::write` to `raft.client_write`, then to the WAL append (group-commit fsync), then quorum commit, then `KvStateMachine::apply` to `InlineSink` to `LocalEngine::*_at`, and a read through `RaftNode::engine()` returns the value; `three_node_election_and_replication`, `tcp_smoke` and `single_node_restart` assert this against real engines on real WAL directories. Snapshot data flows engine, then `scan_versioned`, then framed file, then chunked snapshot lane, then `install_snapshot` into a fresh engine, then ArcSwap swap; `tcp_snapshot_lane_install` and `kill_restart_snapshot_catchup` assert contents through fresh `engine()` calls and `Arc::ptr_eq` identity change. Status: FLOWING.
+Client write goes `RaftNode::write` (size check) to `raft.client_write`, to WAL append and group-commit fsync, to quorum commit, to `KvStateMachine::apply` / `InlineSink` / `LocalEngine::*_at`; a read through `RaftNode::engine()` returns the value, asserted against real engines on real WAL directories by `three_node_election_and_replication`, `three_nodes_over_tcp_elect_and_replicate` and `single_node_restart`. Snapshot data flows engine, `scan_versioned`, framed file, snapshot lane, validate, `install_snapshot`, ArcSwap swap, asserted through fresh `engine()` calls by `tcp_snapshot_lane_install` and `kill_restart_snapshot_catchup`. Status: FLOWING.
 
-### Behavioral Spot-Checks (run by me, in addition to the orchestrator's full-suite baseline)
+### Behavioral Spot-Checks and Gates (run by this verifier)
 
 | Behavior | Command | Result | Status |
 |----------|---------|--------|--------|
-| State machine and R-1 proof | `cargo test --features test-util --lib raft::state_machine` | 22 passed | PASS |
-| WAL writer durability ordering and group commit | `cargo test --features test-util --lib wal::writer` | 20 passed | PASS |
-| WAL recovery and torn tails | `cargo test --features test-util --lib wal::recovery` | 22 passed | PASS |
-| Pipelined AppendEntries | `cargo test --features test-util --test transport pipelined_in_order` | 1 passed | PASS |
-| Heartbeat isolation under 32 MiB snapshot | `cargo test --features test-util --test transport snapshot_does_not_starve_heartbeat` | 1 passed | PASS |
-| Release concurrent-scan stress (NFR-4) | `cargo test --release --features test-util --lib snapshot::concurrent_scan` | 1 passed | PASS |
-| Phase 2 GET tail latency | `bash scripts/check-get-regression.sh` | p99 250ns / 500ns, within 334 / 667 | PASS |
-| Full suite and zero-warning gate | orchestrator baseline: 227 lib, 1 cli_smoke, 13 cluster, 2 api gate, 2 tcp_smoke, 38 transport, 1 wal util; `check-warnings.sh` exit 0 | not re-run | PASS (taken from orchestrator) |
+| Full suite | `cargo test --features test-util` | 252 lib, 8 bin, 1 cli_smoke, 15 cluster, 2 openraft_api_gate, 3 tcp_smoke, 47 transport, 1 wal_test_util_reachable; 0 failed, 0 ignored; exit 0 | PASS |
+| Zero-warning gate | `bash scripts/check-warnings.sh` | exit 0 | PASS |
+| Phase 2 GET tail latency | `bash scripts/check-get-regression.sh` | p99 250 ns / 542 ns within 334 / 667 | PASS |
+| NFR-4 concurrent scan stress | `cargo test --release --features test-util --lib snapshot::concurrent_scan` | 1 passed | PASS |
 
 ### Probe Execution
 
-No `probe-*.sh` scripts exist and no plan declares one. Step 7c: SKIPPED (none declared).
+No `probe-*.sh` scripts exist and no plan declares one. Step 7c: SKIPPED.
 
 ### Requirements Coverage
 
-Authoritative set from PLAN frontmatter (union of all 17 plans): **FR-2, FR-3, FR-4, FR-6, NFR-3, NFR-4**. All six are defined in `.planning/REQUIREMENTS.md` (which has no phase-mapping table, so no ORPHANED requirement can be derived from it). NFR-1 and NFR-2 appear in no plan and are correctly not claimed.
+Union of PLAN frontmatter `requirements` across the 17 plans: FR-2, FR-3, FR-4, FR-6, NFR-3, NFR-4. All six are defined in `.planning/REQUIREMENTS.md`, which has no phase-mapping table, so no ORPHANED requirement can be derived. NFR-1 and NFR-2 appear in no plan and are correctly not claimed.
 
-| Requirement | Source Plans | Description | Status | Evidence |
-|-------------|--------------|-------------|--------|----------|
-| FR-2 | 03-02, 03-05 | Atomic CAS and transaction primitives (WATCH / multi-key conditional) | PARTIAL, NEEDS HUMAN | Single-key CAS is replicated through Raft and replay-safe under fuzzy snapshots (stamp gate plus R-1 proptest). WATCH and multi-key conditionals are not implemented and not scheduled in any roadmap milestone (assumption A12, restated in 03-16-SUMMARY). 03-02 and 03-05 SUMMARYs record `requirements-completed: FR-2`, which overstates this |
-| FR-3 | 03-01, 04, 05, 06, 09, 12, 13, 14, 15, 16, 17 | 3-node cluster, automatic election, term progression, log replication | SATISFIED | `three_node_election_and_replication`, `leader_failover_new_leader_elected`, `partition_heals_and_minority_converges`, `three_nodes_over_tcp_elect_and_replicate` |
-| FR-4 | 03-01, 02, 03, 05, 07, 08, 10, 11, 12, 13, 14, 16 | Disk WAL with group commit, snapshot create/restore to prune the log | SATISFIED on the macOS dev host | WAL writer/recovery tests, `single_node_snapshot_purge_restart`, snapshot tests. NVMe performance is NFR-1/2 territory, not claimed |
-| FR-6 | 03-01, 03, 06, 08, 10, 11, 12, 13, 14, 15, 16 | Crash recovery with fast replay; dynamic membership changes | SATISFIED | `kill_restart_*`, `membership_*` tests. "Fast" replay is not measured |
-| NFR-3 | 03-02, 07, 08, 10, 11 | Zero-copy hot paths, bounded memory, no allocator jitter | PARTIAL (WARNING) | Bounded memory is evidenced: byte-budgeted entry cache that never evicts above the flushed watermark, frame and snapshot size caps, GET p99 unchanged. Zero-copy is not achieved on the replication path: AppendEntries bodies are postcard-serialized (`src/net/protocol.rs`), a copy the research deferred as a later optimization. Reasonable for Phase 3 scope, but the broad "completed" claim is generous |
-| NFR-4 | 03-02, 10, 16 | Lock-free reads and writes, bounded reclamation (no unbounded retired-node accumulation) | SATISFIED for Phase 3's contribution | Release `concurrent_scan` stress asserts slab live blocks stay bounded during a scan with a concurrent writer; scan holds no epoch pin across the scan. The live skiplist still leaves tombstones until the next snapshot restore (known Phase 2 warning, R-2 handled at snapshot time only) |
+| Requirement | Source Plans | Status | Evidence |
+|-------------|--------------|--------|----------|
+| FR-2 | 03-02, 03-05 | SATISFIED for Phase 3 scope (single-key CAS); remainder scheduled | Stamp-gated `cas_at`, `cas_counterexample`, R-1 proptest. WATCH/multi-key accepted as split by the user; ROADMAP Milestone 4.4; REQUIREMENTS.md FR-2 status note |
+| FR-3 | 03-01, 04, 05, 06, 09, 12-17 | SATISFIED | election, failover, partition-heal, TCP election tests ok |
+| FR-4 | 03-01, 02, 03, 05, 07, 08, 10-14, 16 | SATISFIED | WAL writer/recovery tests, snapshot and purge-restart tests ok. NVMe performance belongs to NFR-1/2 (deferred) |
+| FR-6 | 03-01, 03, 06, 08, 10-16 | SATISFIED | `kill_restart_*`, `membership_*` ok. "Fast" replay is not benchmarked here |
+| NFR-3 | 03-02, 07, 08, 10, 11 | PARTIAL (WARNING, unchanged) | Bounded memory evidenced (byte-budgeted entry cache, frame and snapshot caps, GET p99 unchanged). Zero-copy not achieved on the replication path (postcard-encoded AppendEntries); deliberate Phase 3 trade-off, a later optimization |
+| NFR-4 | 03-02, 10, 16 | SATISFIED for Phase 3's contribution | Release concurrent-scan stress bounds slab live blocks; scan holds no epoch pin across the scan |
 
 ### Locked-Decision Audit (03-CONTEXT.md)
 
-| Decision | Honored | Note |
-|----------|---------|------|
-| D-01 segmented WAL, CRC32C, purge by segment delete | Yes | |
-| D-02 dedicated writer thread, Phase 2 ring, no batching timer | Yes | `PARK_BACKSTOP` is a lost-wakeup backstop, not a batching window |
-| D-03 `std::fs` behind a trait | Yes | `SegmentIo` |
-| D-04 fsync before ack by default, relaxation flagged unsafe | Yes | CLI and log warnings |
-| D-05 custom length-prefixed binary over Tokio TCP | Yes | Hello adds magic, version and cluster id |
-| D-06 separate port, shared codec | Yes | `src/wire` has no consensus import (static check) |
-| **D-07 one persistent connection per peer, pipelined** | **Pipelined yes; "one connection" NO** | Up to three connections per peer (replication, heartbeat, snapshot lanes). Needs user ruling (human item 1) |
-| D-08 plaintext, no TLS | Yes | README security section |
-| D-09 epoch-pinned fuzzy snapshot, stamps | Yes | |
-| D-10 snapshot every N applied entries | Yes | Default 1,000,000 (A3 raised it from the 100k example; "configurable, e.g. 100k" permits this) |
-| D-11 framed snapshot file reusing codec | Yes | |
-| D-12 chunked streaming, heartbeats isolated | Yes | Separate connections; test with 32 MiB in flight |
-| D-13 static bootstrap then dynamic membership | Yes | |
-| D-14 1-node cluster same code path | Yes | |
-| D-15 in-process fake-network tests plus few real-TCP smoke tests | Yes | |
-| D-16 kill/restart, torn record discarded | Yes | Non-vacuous assertion on `torn_bytes_discarded` |
+D-01 through D-16 honored. D-07 is honored under the user-accepted A4 amendment in 03-CONTEXT.md. D-04 default `--fsync always` retained. D-06 shared codec with no consensus import in `src/wire`. D-08 plaintext, no TLS (README states the peer port must be private or firewalled).
 
 ### Anti-Patterns Found
 
-None blocking. No debt markers in modified files, no `#[ignore]`d tests, no empty implementations on production paths.
+No `TBD`/`FIXME`/`XXX`/`TODO`/`HACK`/`PLACEHOLDER` markers in src, tests, benches or scripts. The only `unimplemented!` hits are in `tests/openraft_api_gate.rs`, a deliberate compile-time skeleton. No `#[ignore]`.
 
-| File | Line | Pattern | Severity | Impact |
-|------|------|---------|----------|--------|
-| `src/main.rs` | bind and bootstrap block | `--bind` accepted without validation; membership advertises `server.local_addr()`, so `0.0.0.0:PORT` would be published as the node's address | WARNING | Security posture on a plaintext, unauthenticated port; also a functional hazard for multi-node bootstrap (peers cannot dial 0.0.0.0). README-only mitigation |
-| `.planning/phases/03-.../03-VALIDATION.md` | row 03-02-03 | Status column still shows pending / "W0 (script)" although `scripts/check-get-regression.sh` exists and passes | INFO | Stale documentation only; the script exists and the gate paragraph records it passing. The sign-off box "Feedback latency < 30s" is also deliberately left unticked and "Approval: pending" |
+| Item | Severity | Impact |
+|------|----------|--------|
+| Review partial WR-01: a tear persisting later pages without earlier ones, or a client value embedding a valid WAL record, still makes the node refuse to start (clearer message, segments untouched) | WARNING (documented limitation) | Fail-closed, never silent data loss; fix needs an on-disk format change. Does not break a must-have: torn-tail and non-prefix cases covered by tests still recover or fail loudly |
+| Review partial WR-03: an empty `--peers` still initializes a one-node cluster implicitly; warning text corrected | WARNING (documented limitation) | CLI design decision left open; `cli_smoke` and README quickstart rely on it |
+| Review partial IN-11: cluster-wide settings (`max_frame_len`, chunk size, ack window) are validated per node but not negotiated across peers | INFO | Mismatch fails late, not silently |
+| Review partial IN-25: `segment_size`/`max_entry_bytes` must match across members; documented, not checked (library-only setting, no CLI flag) | INFO | Operator-visible only on heterogeneous configs |
+| Review skipped IN-21: no free-space check on snapshot receive; two connections can hold both receive slots | INFO | Hardening deferred; receive is bounded by WR-10 |
+| IN-02 residual: a writer failure between the pre-publish check and the publish drops the final ack | INFO | openraft treats the returned error as fatal either way |
 
 ### Human Verification Required
 
-#### 1. D-07 connection model
+None new. The four items from the previous report were ruled on by the user (03-UAT.md status complete, commits b3de4e1 and 6bbf8e4):
 
-**Test:** Review whether three TCP connections per peer (replication, heartbeat, snapshot) is acceptable against D-07 ("one persistent connection per peer").
-**Expected:** A ruling. Option A: accept interpretation A4 and amend D-07 in CONTEXT.md. Option B: require one multiplexed connection (needs a priority writer to avoid head-of-line blocking; reworks the client, server and lane tests; the wire format is a costly-to-reverse contract per D-05, so deciding before Phase 4/5 builds on it is cheaper).
-**Why human:** Locked user decision; A4 was an unconfirmed researcher assumption. This verifier reports that the code does deviate from the literal wording of D-07 and that it follows D-12's intent.
-
-#### 2. FR-2 traceability
-
-**Test:** Decide how FR-2 is tracked. Single-key CAS is done and replay-safe; WATCH and multi-key conditional updates are not done and not scheduled (A12 still stands).
-**Expected:** Either split FR-2 and add a roadmap item for multi-key transactions (with the snapshot design reopened, since single-key stamping does not cover them), or correct the `requirements-completed: FR-2` entries in 03-02 and 03-05.
-**Why human:** Scope decision; no later phase currently owns it.
-
-#### 3. `--bind` hardening
-
-**Test:** Start the binary with `--bind 0.0.0.0:7443` (accepted today with no warning) and decide whether to warn or refuse non-private binds, and whether to add an advertise-address flag.
-**Expected:** A decision; today only the README advises binding privately.
-**Why human:** Security and UX policy for a port the project itself documents as unauthenticated.
-
-#### 4. NFR-1 / NFR-2 on real hardware
-
-**Test:** On a Linux NVMe host run `cargo bench --bench wal`, and measure replicated 3-node write P99 and throughput.
-**Expected:** P99 write < 2ms, throughput >= 500k ops/s.
-**Why human:** Hardware not available on the macOS dev host. Open in 03-VALIDATION.md; deferred to Phase 6; not claimed by this phase.
+1. D-07 connection model: accepted (interpretation A4); amendment recorded in 03-CONTEXT.md.
+2. FR-2: accepted as split; WATCH/multi-key is ROADMAP Milestone 4.4; REQUIREMENTS.md FR-2 status note.
+3. `--bind`: user accepted the current behaviour (`--advertise` flag; wildcard refused only when initializing a multi-node cluster). Confirmed in `src/main.rs` tests `wildcard_bind_without_advertise_is_refused`, `explicit_advertise_replaces_a_wildcard_bind`, `wildcard_check_runs_only_when_a_multi_node_cluster_is_initialized`.
+4. NFR-1/NFR-2 on a Linux NVMe host: user deferred (UAT row skipped with reason), carried to Phase 6; not claimed by this phase.
 
 ### Gaps Summary
 
-No gaps. Every functional must-have is backed by code that exists, is wired and is exercised by passing tests, including the ones I re-ran (state machine and R-1 proof, WAL writer and recovery, pipelining, heartbeat isolation, release concurrent-scan stress, GET regression guard). The phase is held at `human_needed` solely for the four items above, the most consequential being the D-07 connection-model ruling, which is cheapest to settle now while the wire contract has no other consumers.
+No gaps. All seven must-haves hold against the current code after the review fix passes; no regression was found in the WAL durability ordering, recovery strictness, engine-handle tracking, snapshot lane isolation or Phase 2 GET latency. The full suite (252/8/1/15/2/3/47/1) and both gates are green.
 
 ---
 
-_Verified: 2026-11-10_
+_Verified: 2026-11-12_
 _Verifier: Claude (gsd-verifier)_
