@@ -22,11 +22,11 @@ Phase 1: Architecture Spikes & Deep Research ──► Phase 2: Lock-Free Core &
 - [x] Milestone 2.3: Disruptor-style ring buffer for internal message queues.
 - [x] Milestone 2.4: Local micro-benchmarks & stress tests (evaluating cacheline contention & P99 latency).
 
-## Phase 3: Consensus & Persistence Engine
-- [ ] Milestone 3.1: Raft protocol state machine & log store abstractions.
-- [ ] Milestone 3.2: High-throughput NVMe/disk WAL with group commit and pipelined batching.
-- [ ] Milestone 3.3: Cluster membership, peer discovery, and heartbeat network layer.
-- [ ] Milestone 3.4: Snapshotting engine and state transfer.
+## Phase 3: Consensus & Persistence Engine [COMPLETE - 2026-11-11]
+- [x] Milestone 3.1: Raft protocol state machine & log store abstractions.
+- [x] Milestone 3.2: High-throughput NVMe/disk WAL with group commit and pipelined batching.
+- [x] Milestone 3.3: Cluster membership, peer discovery, and heartbeat network layer.
+- [x] Milestone 3.4: Snapshotting engine and state transfer.
 
 ## Phase 4: State Machine Integration & Read-Path Optimizations
 - [ ] Milestone 4.1: Bridge Raft committed entries to lock-free memory arena.
